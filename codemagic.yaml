@@ -5,32 +5,29 @@ workflows:
     max_build_duration: 60
     working_directory: .
     integrations:
-      app_store_connect: Codemagic API Key   # must match your integration name
+      app_store_connect: Codemagic API Key
     environment:
       flutter: stable
       xcode: latest
     scripts:
-  - name: Flutter version & clean
-    script: |
-      flutter --version
-      flutter clean
-      flutter pub get
-  - name: Set up signing (fetch & install profiles/certs)
-    script: |
-      keychain initialize
-      app-store-connect fetch-signing-files \
-        "com.zeusconcrete.pileestimator" \
-        --type IOS_APP_STORE \
-        --create
-      keychain add-certificates
-      xcode-project use-profiles
-  - name: Build iOS and create IPA
-    script: |
-      flutter build ios --release --no-codesign
-      xcode-project build-ipa
-
+      - name: Flutter prep
+        script: |
+          flutter --version
+          flutter clean
+          flutter pub get
+      - name: Fetch signing files and configure keychain
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "com.zeusconcrete.pileestimator" --type IOS_APP_STORE --create
+          keychain add-certificates
+          xcode-project use-profiles
+      - name: Build IPA
+        script: |
+          flutter build ios --release --no-codesign
+          xcode-project build-ipa --workspace "ios/Runner.xcworkspace" --scheme "Runner"
     artifacts:
       - build/ios/ipa/*.ipa
+      - build/ios/archive/*.xcarchive
     publishing:
       app_store_connect:
         auth: integration

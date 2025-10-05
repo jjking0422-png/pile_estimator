@@ -10,24 +10,25 @@ workflows:
       flutter: stable
       xcode: latest
     scripts:
-      - name: Flutter version & clean
-        script: |
-          flutter --version
-          flutter clean
-          flutter pub get
-      - name: Set up signing (fetch & install profiles/certs)
-        script: |
-          keychain initialize
-          app-store-connect fetch-signing-files \
-            --bundle-id com.zeusconcrete.pileestimator \
-            --type IOS_APP_STORE \
-            --create
-          keychain add-certificates
-      - name: Build iOS and create IPA
-        script: |
-          flutter build ios --release --no-codesign
-          xcode-project use-profiles
-          xcode-project build-ipa
+  - name: Flutter version & clean
+    script: |
+      flutter --version
+      flutter clean
+      flutter pub get
+  - name: Set up signing (fetch & install profiles/certs)
+    script: |
+      keychain initialize
+      app-store-connect fetch-signing-files \
+        "com.zeusconcrete.pileestimator" \
+        --type IOS_APP_STORE \
+        --create
+      keychain add-certificates
+      xcode-project use-profiles
+  - name: Build iOS and create IPA
+    script: |
+      flutter build ios --release --no-codesign
+      xcode-project build-ipa
+
     artifacts:
       - build/ios/ipa/*.ipa
     publishing:

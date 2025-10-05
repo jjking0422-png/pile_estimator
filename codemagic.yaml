@@ -1,32 +1,33 @@
 workflows:
   ios_release:
     name: iOS Release
-    max_build_duration: 60
     instance_type: mac_mini_m1
+    max_build_duration: 60
     working_directory: .
     integrations:
-      app_store_connect: Codemagic API Key   # <-- must match the name you used in Codemagic
+      app_store_connect: Codemagic API Key   # must match your integration name
     environment:
       flutter: stable
       xcode: latest
     scripts:
-  - flutter --version
-  - flutter clean
-  - flutter pub get
-
-  # Fetch signing files (uses your "Codemagic API Key" integration)
-  - keychain initialize
-  - app-store-connect fetch-signing-files
-      bundle_id: com.zeusconcrete.pileestimator
-      type: IOS_APP_STORE
-      create: true
-  - keychain add-certificates
-
-  # Build the iOS app without signing (Flutter), then sign & create IPA with Xcode
-  - flutter build ios --release --no-codesign
-  - xcode-project use-profiles
-  - xcode-project build-ipa
-
+      - name: Flutter version & clean
+        script: |
+          flutter --version
+          flutter clean
+          flutter pub get
+      - name: Set up signing (fetch & install profiles/certs)
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files \
+            --bundle-id com.zeusconcrete.pileestimator \
+            --type IOS_APP_STORE \
+            --create
+          keychain add-certificates
+      - name: Build iOS and create IPA
+        script: |
+          flutter build ios --release --no-codesign
+          xcode-project use-profiles
+          xcode-project build-ipa
     artifacts:
       - build/ios/ipa/*.ipa
     publishing:

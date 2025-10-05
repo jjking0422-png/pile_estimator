@@ -11,6 +11,7 @@ workflows:
       xcode: latest
     scripts:
       - flutter --version
+      - flutter clean
       - flutter pub get
       - flutter build ipa --release
     artifacts:

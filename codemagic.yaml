@@ -10,10 +10,23 @@ workflows:
       flutter: stable
       xcode: latest
     scripts:
-      - flutter --version
-      - flutter clean
-      - flutter pub get
-      - flutter build ipa --release
+  - flutter --version
+  - flutter clean
+  - flutter pub get
+
+  # Fetch signing files (uses your "Codemagic API Key" integration)
+  - keychain initialize
+  - app-store-connect fetch-signing-files
+      bundle_id: com.zeusconcrete.pileestimator
+      type: IOS_APP_STORE
+      create: true
+  - keychain add-certificates
+
+  # Build the iOS app without signing (Flutter), then sign & create IPA with Xcode
+  - flutter build ios --release --no-codesign
+  - xcode-project use-profiles
+  - xcode-project build-ipa
+
     artifacts:
       - build/ios/ipa/*.ipa
     publishing:

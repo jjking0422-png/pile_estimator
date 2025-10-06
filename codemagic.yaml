@@ -15,22 +15,15 @@ workflows:
           flutter --version
           flutter clean
           flutter pub get
-      - name: Install uploaded signing identities
+      - name: Automatic signing and build
         script: |
-          # Installs your uploaded *.p12 certificate into a temporary keychain
           keychain initialize
           keychain add-certificates
-          # Installs your uploaded *.mobileprovision to the expected location
           xcode-project use-profiles
-      - name: Build IPA (codesigned)
-        script: |
-          # Build without Xcode signing first
-          flutter build ios --release --no-codesign
-          # Then archive & sign using the installed profile/certificate
+          flutter build ios --release
           xcode-project build-ipa --workspace "ios/Runner.xcworkspace" --scheme "Runner"
     artifacts:
       - build/ios/ipa/*.ipa
-      - build/ios/archive/*.xcarchive
     publishing:
       app_store_connect:
         auth: integration

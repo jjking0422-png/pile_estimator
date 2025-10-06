@@ -1,4 +1,6 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 void main() {
   runApp(const PileEstimatorApp());
@@ -11,7 +13,10 @@ class PileEstimatorApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Pile Estimator',
-      theme: ThemeData(primarySwatch: Colors.blue),
+      theme: ThemeData(
+        colorSchemeSeed: Colors.blue,
+        useMaterial3: true,
+      ),
       home: const PileEstimatorScreen(),
     );
   }
@@ -25,65 +30,115 @@ class PileEstimatorScreen extends StatefulWidget {
 }
 
 class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
-  final _widthController = TextEditingController();
-  final _heightController = TextEditingController();
-  final _depthController = TextEditingController();
+  final _width = TextEditingController();
+  final _height = TextEditingController();
+  final _depth = TextEditingController();
+
   double? _tons;
+  File? _imageFile;
+  bool _picking = false;
 
+  // simple calc: ft x ft x ft -> cubic yards / density
   void _calculateTons() {
-    final width = double.tryParse(_widthController.text) ?? 0;
-    final height = double.tryParse(_heightController.text) ?? 0;
-    final depth = double.tryParse(_depthController.text) ?? 0;
+    final w = double.tryParse(_width.text) ?? 0;
+    final h = double.tryParse(_height.text) ?? 0;
+    final d = double.tryParse(_depth.text) ?? 0;
 
-    // Volume in cubic yards (27 cubic feet per yard)
-    final cubicYards = (width * height * depth) / 27;
+    final cubicYards = (w * h * d) / 27.0; // 27 cu ft in a cubic yard
+    const densityTonsPerYd3 = 1.5; // rough average for crushed stone
+    setState(() => _tons = cubicYards * densityTonsPerYd3);
+  }
 
-    // Assume average density of crushed stone = 1.5 tons per cubic yard
-    final tons = cubicYards * 1.5;
+  Future<void> _pickFromCamera() async {
+    if (_picking) return;
+    setState(() => _picking = true);
+    try {
+      final picker = ImagePicker();
+      final xfile = await picker.pickImage(source: ImageSource.camera, preferredCameraDevice: CameraDevice.rear);
+      if (xfile != null) {
+        setState(() => _imageFile = File(xfile.path));
+      }
+    } finally {
+      if (mounted) setState(() => _picking = false);
+    }
+  }
 
-    setState(() => _tons = tons);
+  @override
+  void dispose() {
+    _width.dispose();
+    _height.dispose();
+    _depth.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('Pile Estimator')),
-      body: Padding(
-        padding: const EdgeInsets.all(20),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('Enter Pile Dimensions (in feet):',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _widthController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Width'),
+            if (_imageFile != null)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.file(_imageFile!, height: 180, width: double.infinity, fit: BoxFit.cover),
+              )
+            else
+              Container(
+                height: 180,
+                width: double.infinity,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                child: const Text('No photo yet'),
+              ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _picking ? null : _pickFromCamera,
+              icon: const Icon(Icons.photo_camera),
+              label: Text(_picking ? 'Opening camera…' : 'Capture pile photo'),
             ),
-            TextField(
-              controller: _heightController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Height'),
+            const SizedBox(height: 24),
+            Text('Enter pile dimensions (feet)', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(child: _numField(controller: _width, label: 'Width')),
+                const SizedBox(width: 12),
+                Expanded(child: _numField(controller: _height, label: 'Height')),
+                const SizedBox(width: 12),
+                Expanded(child: _numField(controller: _depth, label: 'Depth')),
+              ],
             ),
-            TextField(
-              controller: _depthController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Depth'),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton(
+            const SizedBox(height: 16),
+            FilledButton(
               onPressed: _calculateTons,
               child: const Text('Calculate'),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 12),
             if (_tons != null)
               Text(
-                'Estimated Weight: ${_tons!.toStringAsFixed(2)} tons',
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                'Estimated weight: ${_tons!.toStringAsFixed(2)} tons',
+                style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
               ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _numField({required TextEditingController controller, required String label}) {
+    return TextField(
+      controller: controller,
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
       ),
     );
   }

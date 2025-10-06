@@ -15,5 +15,8 @@ workflows:
       - name: Build unsigned IPA
         script: |
           flutter build ipa --release --no-codesign
+          mkdir -p build/ios/ipa
+          cp -r build/ios/ipa/* build/ios/ipa/ || true
     artifacts:
       - build/ios/ipa/*.ipa
+      - build/ios/ipa/

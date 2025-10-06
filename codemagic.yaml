@@ -1,31 +1,19 @@
 workflows:
-  ios_release:
-    name: iOS Release
+  ios_unsigned:
+    name: iOS Unsigned Build
     instance_type: mac_mini_m1
     max_build_duration: 60
     working_directory: .
-    integrations:
-      app_store_connect: Codemagic API Key
     environment:
       flutter: stable
       xcode: latest
     scripts:
       - name: Prep
         script: |
-          flutter --version
           flutter clean
           flutter pub get
-      - name: Install uploaded signing identities
+      - name: Build unsigned IPA
         script: |
-          keychain initialize
-          keychain add-certificates
-          xcode-project use-profiles
-      - name: Build signed IPA with Flutter
-        script: |
-          flutter build ipa --release --export-method app-store
+          flutter build ipa --release --no-codesign
     artifacts:
       - build/ios/ipa/*.ipa
-    publishing:
-      app_store_connect:
-        auth: integration
-        submit_to_testflight: true

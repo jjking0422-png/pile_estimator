@@ -10,13 +10,29 @@ workflows:
     scripts:
       - name: Prep
         script: |
+          set -e
           flutter clean
           flutter pub get
       - name: Build unsigned IPA
         script: |
+          set -e
           flutter build ipa --release --no-codesign
-          mkdir -p build/ios/ipa
-          cp -r build/ios/ipa/* build/ios/ipa/ || true
+      - name: Locate and stage IPA
+        script: |
+          set -ex
+          echo "PWD: $(pwd)"
+          echo "Listing build/ios recursively so we can see where the IPA went:"
+          ls -R build/ios || true
+          echo "Searching for any .ipa file:"
+          FOUND_IPA=$(find build -type f -name "*.ipa" | head -n 1 || true)
+          if [ -z "$FOUND_IPA" ]; then
+            echo "No IPA found under build/* — failing so we can see the logs above."
+            exit 1
+          fi
+          echo "Found IPA at: $FOUND_IPA"
+          mkdir -p artifacts
+          cp "$FOUND_IPA" artifacts/Runner-unsigned.ipa
+          ls -l artifacts
     artifacts:
-      - build/ios/ipa/*.ipa
-      - build/ios/ipa/
+      - artifacts/*.ipa
+      - build/**/flutter_*.log

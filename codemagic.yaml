@@ -15,15 +15,18 @@ workflows:
           flutter --version
           flutter clean
           flutter pub get
-      - name: Fetch signing files and configure keychain
+      - name: Install uploaded signing identities
         script: |
+          # Installs your uploaded *.p12 certificate into a temporary keychain
           keychain initialize
-          app-store-connect fetch-signing-files "com.zeusconcrete.pileestimator" --type IOS_APP_STORE --create
           keychain add-certificates
+          # Installs your uploaded *.mobileprovision to the expected location
           xcode-project use-profiles
-      - name: Build IPA
+      - name: Build IPA (codesigned)
         script: |
+          # Build without Xcode signing first
           flutter build ios --release --no-codesign
+          # Then archive & sign using the installed profile/certificate
           xcode-project build-ipa --workspace "ios/Runner.xcworkspace" --scheme "Runner"
     artifacts:
       - build/ios/ipa/*.ipa

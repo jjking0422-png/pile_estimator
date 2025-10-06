@@ -9,21 +9,34 @@ workflows:
     environment:
       flutter: stable
       xcode: latest
+
+    # Explicitly bind your uploaded signing identities
+    code_signing:
+      ios_signing:
+        certificate: distribution
+        provisioning_profile: pile_estimator_profile_correct
+
     scripts:
-      - name: Flutter prep
+      - name: Prep
         script: |
           flutter --version
           flutter clean
           flutter pub get
-      - name: Automatic signing and build
+      - name: Install signing and apply profiles
         script: |
           keychain initialize
           keychain add-certificates
+          # This step injects PROVISIONING_PROFILE_SPECIFIER into the project for the archive step
           xcode-project use-profiles
-          flutter build ios --release
+      - name: Build IPA with Xcode (no Flutter codesign)
+        script: |
+          # Build & archive with the applied provisioning profile
           xcode-project build-ipa --workspace "ios/Runner.xcworkspace" --scheme "Runner"
+
     artifacts:
       - build/ios/ipa/*.ipa
+      - build/ios/archive/*.xcarchive
+
     publishing:
       app_store_connect:
         auth: integration

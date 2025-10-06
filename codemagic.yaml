@@ -1,38 +1,29 @@
-workflows:
-  ios_unsigned:
-    name: iOS Unsigned Build
-    instance_type: mac_mini_m1
-    max_build_duration: 60
-    working_directory: .
-    environment:
-      flutter: stable
-      xcode: latest
-    scripts:
-      - name: Prep
-        script: |
-          set -e
-          flutter clean
-          flutter pub get
-      - name: Build unsigned IPA
-        script: |
-          set -e
-          flutter build ipa --release --no-codesign
-      - name: Locate and stage IPA
-        script: |
-          set -ex
-          echo "PWD: $(pwd)"
-          echo "Listing build/ios recursively so we can see where the IPA went:"
-          ls -R build/ios || true
-          echo "Searching for any .ipa file:"
-          FOUND_IPA=$(find build -type f -name "*.ipa" | head -n 1 || true)
-          if [ -z "$FOUND_IPA" ]; then
-            echo "No IPA found under build/* — failing so we can see the logs above."
-            exit 1
-          fi
-          echo "Found IPA at: $FOUND_IPA"
-          mkdir -p artifacts
-          cp "$FOUND_IPA" artifacts/Runner-unsigned.ipa
-          ls -l artifacts
-    artifacts:
-      - artifacts/*.ipa
-      - build/**/flutter_*.log
+scripts:
+  - name: Prep
+    script: |
+      set -e
+      flutter clean
+      flutter pub get
+  - name: Build iOS (no codesign)
+    script: |
+      set -e
+      flutter build ios --release --no-codesign
+  - name: Package .app into unsigned IPA
+    script: |
+      set -ex
+      echo "Searching for Runner.app under build/* ..."
+      APP_PATH=$(find build -type d -name "Runner.app" | head -n 1 || true)
+      if [ -z "$APP_PATH" ]; then
+        echo "Runner.app not found. Aborting."
+        find build -maxdepth 3 -type d | sed 's/^/FOUND DIR: /'
+        exit 1
+      fi
+      echo "Found app at: $APP_PATH"
+      WORKDIR=$(pwd)
+      mkdir -p artifacts
+      cd "$(dirname "$APP_PATH")"
+      rm -rf Payload
+      mkdir Payload
+      cp -R "Runner.app" Payload/
+      zip -r "$WORKDIR/artifacts/Runner-unsigned.ipa" Payload
+      ls -l "$WORKDIR/artifacts"

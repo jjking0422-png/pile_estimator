@@ -370,7 +370,8 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zeusconcrete.pileestimator;
                                 DEVELOPMENT_TEAM = CV4Y846CRN;
-                                CODE_SIGN_STYLE = Automatic;
+                                CODE_SIGN_STYLE = Manual;
+                                PROVISIONING_PROFILE_SPECIFIER = d4f1d52c-5fe3-49f5-9445-b2238680acb6;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
@@ -552,6 +553,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.zeusconcrete.pileestimator;
                                 DEVELOPMENT_TEAM = CV4Y846CRN;
                                 CODE_SIGN_STYLE = Automatic;
+                                PROVISIONING_PROFILE_SPECIFIER = d4f1d52c-5fe3-49f5-9445-b2238680acb6;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -576,6 +578,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.zeusconcrete.pileestimator;
                                 DEVELOPMENT_TEAM = CV4Y846CRN;
                                 CODE_SIGN_STYLE = Automatic;
+                                PROVISIONING_PROFILE_SPECIFIER = d4f1d52c-5fe3-49f5-9445-b2238680acb6;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;

@@ -22,7 +22,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Tapped points (image-space in widget logical pixels)
+  // Tapped points (in widget logical coordinates)
   Offset? _calibA;
   Offset? _calibB;
   Offset? _measA;
@@ -34,8 +34,34 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   // Latest computed measurement (in feet)
   double? _measuredFeet;
 
+  // Intrinsic image size so we can match aspect ratio and avoid cropping
+  Size? _imageSize; // set in initState via ImageStream
+  final GlobalKey _imageKey = GlobalKey();
+
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
+
+  @override
+  void initState() {
+    super.initState();
+    // Resolve the image to get its intrinsic size (width/height in px)
+    final provider = FileImage(widget.imageFile);
+    final stream = provider.resolve(const ImageConfiguration());
+    ImageStreamListener? listener;
+    listener = ImageStreamListener((info, _) {
+      final w = info.image.width.toDouble();
+      final h = info.image.height.toDouble();
+      if (mounted) {
+        setState(() => _imageSize = Size(w, h));
+      }
+      stream.removeListener(listener!);
+    }, onError: (e, st) {
+      // Fallback to 4:3 if something goes wrong
+      if (mounted) setState(() => _imageSize = const Size(400, 300));
+      stream.removeListener(listener!);
+    });
+    stream.addListener(listener);
+  }
 
   void _onTapDown(TapDownDetails d) {
     final p = d.localPosition;
@@ -133,6 +159,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
+    final ar = _imageSize == null
+        ? (4 / 3) // temporary until we know the real size
+        : (_imageSize!.width / _imageSize!.height);
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Measure Depth'),
@@ -146,18 +176,19 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       ),
       body: Column(
         children: [
-          // Image + overlay (contain so full image is visible)
+          // Image + overlay — sized to the *real* image aspect ratio
           AspectRatio(
-            aspectRatio: 4 / 3,
+            aspectRatio: ar,
             child: Stack(
               children: [
                 Positioned.fill(
                   child: Image.file(
                     widget.imageFile,
-                    fit: BoxFit.contain, // <— show the whole photo, no cropping
+                    fit: BoxFit.contain, // full image visible, no cropping
+                    key: _imageKey,
                   ),
                 ),
-                // Tap/paint layer
+                // Tap/paint layer (same size as the image widget)
                 Positioned.fill(
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,

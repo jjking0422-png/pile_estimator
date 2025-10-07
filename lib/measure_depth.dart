@@ -22,7 +22,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Tapped points (in widget logical coordinates)
+  // Tapped points (in the image canvas coordinates)
   Offset? _calibA;
   Offset? _calibB;
   Offset? _measA;
@@ -34,9 +34,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   // Latest computed measurement (in feet)
   double? _measuredFeet;
 
-  // Intrinsic image size so we can match aspect ratio and avoid cropping
-  Size? _imageSize; // set in initState via ImageStream
-  final GlobalKey _imageKey = GlobalKey();
+  // Intrinsic image size (so we can size the canvas to the real photo)
+  Size? _imageSize;
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -44,26 +43,32 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   @override
   void initState() {
     super.initState();
-    // Resolve the image to get its intrinsic size (width/height in px)
+    _resolveImageSize();
+  }
+
+  void _resolveImageSize() {
     final provider = FileImage(widget.imageFile);
     final stream = provider.resolve(const ImageConfiguration());
     ImageStreamListener? listener;
     listener = ImageStreamListener((info, _) {
-      final w = info.image.width.toDouble();
-      final h = info.image.height.toDouble();
-      if (mounted) {
-        setState(() => _imageSize = Size(w, h));
-      }
+      setState(() {
+        _imageSize = Size(
+          info.image.width.toDouble(),
+          info.image.height.toDouble(),
+        );
+      });
       stream.removeListener(listener!);
     }, onError: (e, st) {
       // Fallback to 4:3 if something goes wrong
-      if (mounted) setState(() => _imageSize = const Size(400, 300));
+      setState(() => _imageSize = const Size(400, 300));
       stream.removeListener(listener!);
     });
     stream.addListener(listener);
   }
 
   void _onTapDown(TapDownDetails d) {
+    // Because the GestureDetector sits in the same SizedBox as the Image,
+    // d.localPosition is already in the "image canvas" coordinate space.
     final p = d.localPosition;
     setState(() {
       if (_mode == MeasureMode.calibrate) {
@@ -72,7 +77,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
         } else if (_calibB == null) {
           _calibB = p;
         } else {
-          // start over after two points
           _calibA = p;
           _calibB = null;
         }
@@ -108,9 +112,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     }
     setState(() {
       _pixelsPerFoot = pixels / knownFt; // px per ft
-      // switch to measuring after calibration
       _mode = MeasureMode.measure;
-      // clear any prior measurement points
       _measA = _measB = null;
       _measuredFeet = null;
     });
@@ -159,9 +161,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    final ar = _imageSize == null
-        ? (4 / 3) // temporary until we know the real size
-        : (_imageSize!.width / _imageSize!.height);
+    // Until we know the real image size, show a small placeholder box
+    final hasSize = _imageSize != null;
+    final imgW = _imageSize?.width ?? 400;
+    final imgH = _imageSize?.height ?? 300;
 
     return Scaffold(
       appBar: AppBar(
@@ -176,34 +179,43 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       ),
       body: Column(
         children: [
-          // Image + overlay — sized to the *real* image aspect ratio
-          AspectRatio(
-            aspectRatio: ar,
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: Image.file(
-                    widget.imageFile,
-                    fit: BoxFit.contain, // full image visible, no cropping
-                    key: _imageKey,
-                  ),
-                ),
-                // Tap/paint layer (same size as the image widget)
-                Positioned.fill(
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTapDown: _onTapDown,
-                    child: CustomPaint(
-                      painter: _OverlayPainter(
-                        calibA: _calibA,
-                        calibB: _calibB,
-                        measA: _measA,
-                        measB: _measB,
+          // Full-width canvas that preserves the image without cropping.
+          // We use a centered FittedBox so the whole photo is visible,
+          // and we stack the CustomPaint *inside the same SizedBox* as the Image,
+          // so coordinates and taps match exactly after scaling.
+          Expanded(
+            child: Center(
+              child: FittedBox(
+                fit: BoxFit.contain,
+                child: SizedBox(
+                  width: imgW,
+                  height: imgH,
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: Image.file(
+                          widget.imageFile,
+                          fit: BoxFit.fill, // fill the SizedBox (which equals the intrinsic size)
+                        ),
                       ),
-                    ),
+                      Positioned.fill(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTapDown: hasSize ? _onTapDown : null,
+                          child: CustomPaint(
+                            painter: _OverlayPainter(
+                              calibA: _calibA,
+                              calibB: _calibB,
+                              measA: _measA,
+                              measB: _measB,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
+              ),
             ),
           ),
 
@@ -271,7 +283,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                     Expanded(
                       child: _infoTile(
                         title: 'Measure points',
-                        value: _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'),
+                        value: _measurementReady ? '2/2 ✓' : (_meAorB() == 0 ? '0/2' : '1/2'),
                         icon: Icons.straighten_outlined,
                       ),
                     ),
@@ -308,6 +320,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
         ],
       ),
     );
+  }
+
+  int _meAorB() {
+    int c = 0;
+    if (_measA != null) c++;
+    if (_measB != null) c++;
+    return c;
   }
 
   Widget _infoTile({required String title, required String value, required IconData icon}) {

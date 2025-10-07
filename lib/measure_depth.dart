@@ -173,8 +173,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                       width: double.infinity,
                       height: double.infinity,
                       child: Image.file(
-                        widget.imageFile,
-                        fit: BoxFit.cover,
+                        Image.file(
+                         widget.imageFile,
+                         fit: BoxFit.contain, // shows the full photo inside the frame
+),
+
                       ),
                     ),
                     // Tap layer

@@ -67,8 +67,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   }
 
   void _onTapDown(TapDownDetails d) {
-    // Because the GestureDetector sits in the same SizedBox as the Image,
-    // d.localPosition is already in the "image canvas" coordinate space.
     final p = d.localPosition;
     setState(() {
       if (_mode == MeasureMode.calibrate) {
@@ -159,9 +157,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    // Until we know the real image size, show a small placeholder box
     final hasSize = _imageSize != null;
     final imgW = _imageSize?.width ?? 400;
     final imgH = _imageSize?.height ?? 300;
@@ -179,10 +174,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       ),
       body: Column(
         children: [
-          // Full-width canvas that preserves the image without cropping.
-          // We use a centered FittedBox so the whole photo is visible,
-          // and we stack the CustomPaint *inside the same SizedBox* as the Image,
-          // so coordinates and taps match exactly after scaling.
+          // Full-width canvas with no cropping.
           Expanded(
             child: Center(
               child: FittedBox(
@@ -195,7 +187,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                       Positioned.fill(
                         child: Image.file(
                           widget.imageFile,
-                          fit: BoxFit.fill, // fill the SizedBox (which equals the intrinsic size)
+                          fit: BoxFit.fill, // fill the SizedBox intrinsic canvas
                         ),
                       ),
                       Positioned.fill(
@@ -283,7 +275,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                     Expanded(
                       child: _infoTile(
                         title: 'Measure points',
-                        value: _measurementReady ? '2/2 ✓' : (_meAorB() == 0 ? '0/2' : '1/2'),
+                        value: _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'),
                         icon: Icons.straighten_outlined,
                       ),
                     ),
@@ -320,13 +312,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
         ],
       ),
     );
-  }
-
-  int _meAorB() {
-    int c = 0;
-    if (_measA != null) c++;
-    if (_measB != null) c++;
-    return c;
   }
 
   Widget _infoTile({required String title, required String value, required IconData icon}) {
@@ -371,26 +356,71 @@ class _OverlayPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paintCal = Paint()
-      ..color = const Color(0xFF1565C0) // blue
-      ..strokeWidth = 3;
+    // Styles that stand out on any background
+    const double dotRadius = 10;         // bigger points
+    const double haloRadius = 14;        // white halo behind each point
+    const double strokeWidth = 5;        // thicker lines
 
-    final paintMeas = Paint()
-      ..color = const Color(0xFF2E7D32) // green
-      ..strokeWidth = 3;
+    final whiteHalo = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-    final dotCal = Paint()..color = const Color(0xFF1565C0);
-    final dotMeas = Paint()..color = const Color(0xFF2E7D32);
+    final blue = Paint()
+      ..color = const Color(0xFF1565C0)
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-    // Calibration line (blue)
-    if (calibA != null) canvas.drawCircle(calibA!, 5, dotCal);
-    if (calibB != null) canvas.drawCircle(calibB!, 5, dotCal);
-    if (calibA != null && calibB != null) canvas.drawLine(calibA!, calibB!, paintCal);
+    final green = Paint()
+      ..color = const Color(0xFF2E7D32)
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-    // Measurement line (green)
-    if (measA != null) canvas.drawCircle(measA!, 5, dotMeas);
-    if (measB != null) canvas.drawCircle(measB!, 5, dotMeas);
-    if (measA != null && measB != null) canvas.drawLine(measA!, measB!, paintMeas);
+    final blueLine = Paint()
+      ..color = const Color(0xFF1565C0)
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    final greenLine = Paint()
+      ..color = const Color(0xFF2E7D32)
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    // Helper to draw a point with halo
+    void point(Offset? p, Paint color) {
+      if (p == null) return;
+      canvas.drawCircle(p, haloRadius, whiteHalo); // halo
+      canvas.drawCircle(p, dotRadius, color);      // colored dot
+    }
+
+    // Calibration (blue)
+    point(calibA, blue);
+    point(calibB, blue);
+    if (calibA != null && calibB != null) {
+      // halo under line for contrast
+      final haloLine = Paint()
+        ..color = Colors.white.withOpacity(0.9)
+        ..strokeWidth = strokeWidth + 2
+        ..strokeCap = StrokeCap.round
+        ..isAntiAlias = true;
+      canvas.drawLine(calibA!, calibB!, haloLine);
+      canvas.drawLine(calibA!, calibB!, blueLine);
+    }
+
+    // Measurement (green)
+    point(measA, green);
+    point(measB, green);
+    if (measA != null && measB != null) {
+      final haloLine = Paint()
+        ..color = Colors.white.withOpacity(0.9)
+        ..strokeWidth = strokeWidth + 2
+        ..strokeCap = StrokeCap.round
+        ..isAntiAlias = true;
+      canvas.drawLine(measA!, measB!, haloLine);
+      canvas.drawLine(measA!, measB!, greenLine);
+    }
   }
 
   @override

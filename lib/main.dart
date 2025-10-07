@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'measure_depth.dart';
+
 
 void main() {
   runApp(const PileEstimatorApp());
@@ -126,6 +128,27 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
               onPressed: _picking ? null : _pickFromCamera,
               icon: const Icon(Icons.photo_camera),
               label: Text(_picking ? 'Opening camera…' : 'Capture pile photo'),
+            if (_imageFile != null) ...[
+  const SizedBox(height: 8),
+  OutlinedButton.icon(
+    onPressed: () async {
+      final measured = await Navigator.of(context).push<double>(
+        MaterialPageRoute(
+          builder: (_) => MeasureDepthScreen(imageFile: _imageFile!),
+        ),
+      );
+      if (measured != null) {
+        _depth.text = measured.toStringAsFixed(2);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Depth set to ${measured.toStringAsFixed(2)} ft')),
+        );
+      }
+    },
+    icon: const Icon(Icons.straighten),
+    label: const Text('Measure depth'),
+  ),
+],
+
             ),
             const SizedBox(height: 24),
 

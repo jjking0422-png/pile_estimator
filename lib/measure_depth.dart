@@ -20,17 +20,21 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       appBar: AppBar(title: const Text('Measure Depth')),
       body: Column(
         children: [
-          // show the photo
+          // Show the photo you captured
           AspectRatio(
             aspectRatio: 4 / 3,
-            child: Image.file(widget.imageFile, fit: BoxFit.cover, width: double.infinity),
+            child: Image.file(
+              widget.imageFile,
+              fit: BoxFit.cover,
+              width: double.infinity,
+            ),
           ),
           const SizedBox(height: 12),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Text(
-              'Stub for now: use the buttons below to return a test value.\n'
-              'Next step we’ll add tap-to-set points + ruler overlay.',
+              'Stub for now: choose a depth value to return.\n'
+              'Next, we will add two-point measurement with a pixel ruler.',
               style: theme.textTheme.bodyMedium,
             ),
           ),
@@ -38,7 +42,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
           Wrap(
             spacing: 8,
             children: [
-              for (final v in [2.0, 4.0, 6.0, 8.0])
+              for (final v in [2.0, 4.0, 6.0, 8.0, 10.0])
                 FilledButton(
                   onPressed: () => setState(() => _measuredFeet = v),
                   child: Text('${v.toStringAsFixed(0)} ft'),
@@ -57,7 +61,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                 _measuredFeet > 0 ? 'Use $_measuredFeet ft' : 'Pick a value',
               ),
             ),
-          )
+          ),
         ],
       ),
     );

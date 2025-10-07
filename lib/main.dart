@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'measure_depth.dart';
 
-
 void main() {
   runApp(const PileEstimatorApp());
 }
@@ -36,7 +35,7 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
   final _height = TextEditingController();
   final _depth = TextEditingController();
 
-  // Tons per cubic yard (rule-of-thumb values; you can tweak later)
+  // Tons per cubic yard (rule-of-thumb values; tweak as needed)
   final Map<String, double> _densities = const {
     'Crushed stone (avg)': 1.50,
     'Crushed concrete': 1.40,
@@ -56,7 +55,7 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
     final h = double.tryParse(_height.text) ?? 0;
     final d = double.tryParse(_depth.text) ?? 0;
 
-    // Simple rectangular estimate for now: ft³ → yd³
+    // Simple rectangular estimate: ft³ → yd³
     final cubicYards = (w * h * d) / 27.0;
     final density = _densities[_selectedMaterial] ?? 1.5;
     final tons = cubicYards * density;
@@ -128,28 +127,28 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
               onPressed: _picking ? null : _pickFromCamera,
               icon: const Icon(Icons.photo_camera),
               label: Text(_picking ? 'Opening camera…' : 'Capture pile photo'),
-            if (_imageFile != null) ...[
-  const SizedBox(height: 8),
-  OutlinedButton.icon(
-    onPressed: () async {
-      final measured = await Navigator.of(context).push<double>(
-        MaterialPageRoute(
-          builder: (_) => MeasureDepthScreen(imageFile: _imageFile!),
-        ),
-      );
-      if (measured != null) {
-        _depth.text = measured.toStringAsFixed(2);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Depth set to ${measured.toStringAsFixed(2)} ft')),
-        );
-      }
-    },
-    icon: const Icon(Icons.straighten),
-    label: const Text('Measure depth'),
-  ),
-],
-
             ),
+            if (_imageFile != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final measured = await Navigator.of(context).push<double>(
+                    MaterialPageRoute(
+                      builder: (_) => MeasureDepthScreen(imageFile: _imageFile!),
+                    ),
+                  );
+                  if (measured != null) {
+                    _depth.text = measured.toStringAsFixed(2);
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Depth set to ${measured.toStringAsFixed(2)} ft')),
+                    );
+                  }
+                },
+                icon: const Icon(Icons.straighten),
+                label: const Text('Measure depth'),
+              ),
+            ],
             const SizedBox(height: 24),
 
             Text('Enter pile dimensions (feet)', style: theme.textTheme.titleMedium),
@@ -204,8 +203,10 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
                         Text('Volume: ${_cubicYards!.toStringAsFixed(2)} yd³',
                             style: theme.textTheme.titleMedium),
                       if (_tons != null)
-                        Text('Estimated weight (${_selectedMaterial}): ${_tons!.toStringAsFixed(2)} tons',
-                            style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold)),
+                        Text(
+                          'Estimated weight (${_selectedMaterial}): ${_tons!.toStringAsFixed(2)} tons',
+                          style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
+                        ),
                     ],
                   ),
                 ),

@@ -34,19 +34,35 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
   final _height = TextEditingController();
   final _depth = TextEditingController();
 
+  // Tons per cubic yard (rule-of-thumb values; you can tweak later)
+  final Map<String, double> _densities = const {
+    'Crushed stone (avg)': 1.50,
+    'Crushed concrete': 1.40,
+    'Pea gravel': 1.45,
+    'Sand (damp)': 1.35,
+    'Recycled asphalt millings': 1.25,
+  };
+
+  String _selectedMaterial = 'Crushed stone (avg)';
+  double? _cubicYards;
   double? _tons;
   File? _imageFile;
   bool _picking = false;
 
-  // simple calc: ft x ft x ft -> cubic yards / density
-  void _calculateTons() {
+  void _calculate() {
     final w = double.tryParse(_width.text) ?? 0;
     final h = double.tryParse(_height.text) ?? 0;
     final d = double.tryParse(_depth.text) ?? 0;
 
-    final cubicYards = (w * h * d) / 27.0; // 27 cu ft in a cubic yard
-    const densityTonsPerYd3 = 1.5; // rough average for crushed stone
-    setState(() => _tons = cubicYards * densityTonsPerYd3);
+    // Simple rectangular estimate for now: ft³ → yd³
+    final cubicYards = (w * h * d) / 27.0;
+    final density = _densities[_selectedMaterial] ?? 1.5;
+    final tons = cubicYards * density;
+
+    setState(() {
+      _cubicYards = cubicYards;
+      _tons = tons;
+    });
   }
 
   Future<void> _pickFromCamera() async {
@@ -54,7 +70,10 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
     setState(() => _picking = true);
     try {
       final picker = ImagePicker();
-      final xfile = await picker.pickImage(source: ImageSource.camera, preferredCameraDevice: CameraDevice.rear);
+      final xfile = await picker.pickImage(
+        source: ImageSource.camera,
+        preferredCameraDevice: CameraDevice.rear,
+      );
       if (xfile != null) {
         setState(() => _imageFile = File(xfile.path));
       }
@@ -84,7 +103,12 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
             if (_imageFile != null)
               ClipRRect(
                 borderRadius: BorderRadius.circular(12),
-                child: Image.file(_imageFile!, height: 180, width: double.infinity, fit: BoxFit.cover),
+                child: Image.file(
+                  _imageFile!,
+                  height: 180,
+                  width: double.infinity,
+                  fit: BoxFit.cover,
+                ),
               )
             else
               Container(
@@ -104,6 +128,7 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
               label: Text(_picking ? 'Opening camera…' : 'Capture pile photo'),
             ),
             const SizedBox(height: 24),
+
             Text('Enter pile dimensions (feet)', style: theme.textTheme.titleMedium),
             const SizedBox(height: 8),
             Row(
@@ -115,16 +140,52 @@ class _PileEstimatorScreenState extends State<PileEstimatorScreen> {
                 Expanded(child: _numField(controller: _depth, label: 'Depth')),
               ],
             ),
+
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Text('Material:', style: theme.textTheme.titleMedium),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: _selectedMaterial,
+                    items: _densities.keys
+                        .map((k) => DropdownMenuItem(value: k, child: Text(k)))
+                        .toList(),
+                    onChanged: (v) => setState(() => _selectedMaterial = v ?? _selectedMaterial),
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
             const SizedBox(height: 16),
             FilledButton(
-              onPressed: _calculateTons,
+              onPressed: _calculate,
               child: const Text('Calculate'),
             ),
             const SizedBox(height: 12),
-            if (_tons != null)
-              Text(
-                'Estimated weight: ${_tons!.toStringAsFixed(2)} tons',
-                style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
+            if (_cubicYards != null || _tons != null)
+              Card(
+                elevation: 0,
+                color: theme.colorScheme.surfaceVariant,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (_cubicYards != null)
+                        Text('Volume: ${_cubicYards!.toStringAsFixed(2)} yd³',
+                            style: theme.textTheme.titleMedium),
+                      if (_tons != null)
+                        Text('Estimated weight (${_selectedMaterial}): ${_tons!.toStringAsFixed(2)} tons',
+                            style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
               ),
           ],
         ),

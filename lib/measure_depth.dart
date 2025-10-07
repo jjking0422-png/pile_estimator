@@ -1,14 +1,8 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 
-/// Two-step measuring:
-/// 1) Calibrate: tap TWO points on a known-length object in the photo (e.g., 4 ft),
-///    enter that length, then press "Set calibration".
-/// 2) Measure: tap TWO points spanning the pile depth, press "Compute depth", then "Use depth".
-
 class MeasureDepthScreen extends StatefulWidget {
   final File imageFile;
-
   const MeasureDepthScreen({super.key, required this.imageFile});
 
   @override
@@ -16,26 +10,31 @@ class MeasureDepthScreen extends StatefulWidget {
 }
 
 enum MeasureMode { calibrate, measure }
+enum _Handle { none, calibA, calibB, measA, measB }
 
 class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   final TextEditingController _knownLengthFt = TextEditingController(text: '4.0');
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Tapped points (in the image canvas coordinates)
-  Offset? _calibA;
-  Offset? _calibB;
-  Offset? _measA;
-  Offset? _measB;
+  // Points in image-canvas coordinates
+  Offset? _calibA, _calibB, _measA, _measB;
 
-  // Pixels-per-foot after calibration
-  double? _pixelsPerFoot;
+  // Drag state
+  _Handle _dragging = _Handle.none;
 
-  // Latest computed measurement (in feet)
+  // Calibration
+  double? _pxPerFt;
   double? _measuredFeet;
 
-  // Intrinsic image size (so we can size the canvas to the real photo)
+  // Intrinsic image size for exact canvas sizing
   Size? _imageSize;
+
+  // Visual tuning
+  static const double _dotRadius = 18;     // doubled
+  static const double _haloRadius = 24;    // doubled
+  static const double _stroke = 10;        // doubled
+  static const double _hitRadius = 28;     // radius for grabbing a handle
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -52,112 +51,181 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     ImageStreamListener? listener;
     listener = ImageStreamListener((info, _) {
       setState(() {
-        _imageSize = Size(
-          info.image.width.toDouble(),
-          info.image.height.toDouble(),
-        );
+        _imageSize = Size(info.image.width.toDouble(), info.image.height.toDouble());
       });
       stream.removeListener(listener!);
     }, onError: (e, st) {
-      // Fallback to 4:3 if something goes wrong
       setState(() => _imageSize = const Size(400, 300));
       stream.removeListener(listener!);
     });
     stream.addListener(listener);
   }
 
-  void _onTapDown(TapDownDetails d) {
+  // ---------- Gesture logic (tap + drag, adjustable endpoints) ----------
+
+  _Handle _hitTest(Offset p) {
+    double d(Offset? a) => a == null ? 1e9 : (p - a).distance;
+    final entries = <_Handle, double>{
+      _Handle.calibA: d(_calibA),
+      _Handle.calibB: d(_calibB),
+      _Handle.measA:  d(_measA),
+      _Handle.measB:  d(_measB),
+    };
+    _Handle best = _Handle.none;
+    double bestD = _hitRadius;
+    entries.forEach((h, dist) {
+      if (dist < bestD) {
+        bestD = dist;
+        best = h;
+      }
+    });
+    // Only allow dragging handles relevant to the current mode
+    if (_mode == MeasureMode.calibrate &&
+        (best == _Handle.measA || best == _Handle.measB)) return _Handle.none;
+    if (_mode == MeasureMode.measure &&
+        (best == _Handle.calibA || best == _Handle.calibB)) return _Handle.none;
+    return best;
+  }
+
+  void _onPanStart(DragStartDetails d) {
     final p = d.localPosition;
+    // Try to grab a nearby handle first
+    final grabbed = _hitTest(p);
+    if (grabbed != _Handle.none) {
+      setState(() => _dragging = grabbed);
+      return;
+    }
+
+    // Otherwise start laying out a new segment in the active mode
     setState(() {
       if (_mode == MeasureMode.calibrate) {
-        if (_calibA == null) {
+        // Start new calibration line
+        if (_calibA == null || (_calibA != null && _calibB != null)) {
           _calibA = p;
-        } else if (_calibB == null) {
-          _calibB = p;
+          _calibB = p;      // live-drag to set B
+          _dragging = _Handle.calibB;
         } else {
-          _calibA = p;
-          _calibB = null;
+          // A is set, start dragging B
+          _calibB = p;
+          _dragging = _Handle.calibB;
         }
       } else {
-        if (_measA == null) {
+        if (_measA == null || (_measA != null && _measB != null)) {
           _measA = p;
-        } else if (_measB == null) {
           _measB = p;
+          _dragging = _Handle.measB;
         } else {
-          _measA = p;
-          _measB = null;
+          _measB = p;
+          _dragging = _Handle.measB;
         }
       }
     });
   }
 
+  void _onPanUpdate(DragUpdateDetails d) {
+    if (_dragging == _Handle.none) return;
+    final p = d.localPosition;
+    setState(() {
+      switch (_dragging) {
+        case _Handle.calibA: _calibA = p; break;
+        case _Handle.calibB: _calibB = p; break;
+        case _Handle.measA:  _measA  = p; break;
+        case _Handle.measB:  _measB  = p; break;
+        case _Handle.none: break;
+      }
+    });
+  }
+
+  void _onPanEnd(DragEndDetails d) {
+    setState(() => _dragging = _Handle.none);
+  }
+
+  // Fallback tap (single taps without dragging)
+  void _onTapDown(TapDownDetails d) {
+    final p = d.localPosition;
+    setState(() {
+      if (_mode == MeasureMode.calibrate) {
+        if (_calibA == null) _calibA = p;
+        else if (_calibB == null) _calibB = p;
+        else { _calibA = p; _calibB = null; }
+      } else {
+        if (_measA == null) _measA = p;
+        else if (_measB == null) _measB = p;
+        else { _measA = p; _measB = null; }
+      }
+    });
+  }
+
+  // ---------- Calc / flow ----------
+
   double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
     if (!_calibrationReady) {
-      _show('Tap two calibration points first.');
+      _snack('Tap/drag two calibration points first.');
       return;
     }
-    final knownFt = double.tryParse(_knownLengthFt.text);
-    if (knownFt == null || knownFt <= 0) {
-      _show('Enter a valid known length (ft).');
+    final known = double.tryParse(_knownLengthFt.text);
+    if (known == null || known <= 0) {
+      _snack('Enter a valid known length (ft).');
       return;
     }
-    final pixels = _dist(_calibA!, _calibB!);
-    if (pixels <= 0) {
-      _show('Calibration points are too close.');
+    final px = _dist(_calibA!, _calibB!);
+    if (px <= 0) {
+      _snack('Calibration points overlap.');
       return;
     }
     setState(() {
-      _pixelsPerFoot = pixels / knownFt; // px per ft
+      _pxPerFt = px / known;
       _mode = MeasureMode.measure;
       _measA = _measB = null;
       _measuredFeet = null;
     });
-    _show('Calibration set: ${_pixelsPerFoot!.toStringAsFixed(2)} px/ft. Now tap two points to measure.');
+    _snack('Calibration set: ${_pxPerFt!.toStringAsFixed(2)} px/ft. Now measure.');
   }
 
-  void _computeMeasurement() {
-    if (_pixelsPerFoot == null) {
-      _show('Set calibration first.');
+  void _compute() {
+    if (_pxPerFt == null) {
+      _snack('Set calibration first.');
       return;
     }
     if (!_measurementReady) {
-      _show('Tap two measurement points.');
+      _snack('Place two measurement points (tap or drag).');
       return;
     }
-    final pixels = _dist(_measA!, _measB!);
-    final feet = pixels / _pixelsPerFoot!;
-    setState(() => _measuredFeet = feet);
-    _show('Depth = ${feet.toStringAsFixed(2)} ft');
+    final px = _dist(_measA!, _measB!);
+    final ft = px / _pxPerFt!;
+    setState(() => _measuredFeet = ft);
+    _snack('Depth = ${ft.toStringAsFixed(2)} ft');
   }
 
   void _finish() {
-    if (_measuredFeet == null || _measuredFeet! <= 0) {
-      _show('No depth measured yet.');
+    final v = _measuredFeet;
+    if (v == null || v <= 0) {
+      _snack('No depth computed yet.');
       return;
     }
-    Navigator.of(context).pop<double>(_measuredFeet);
+    Navigator.of(context).pop<double>(v);
   }
 
   void _resetAll() {
     setState(() {
       _calibA = _calibB = _measA = _measB = null;
-      _pixelsPerFoot = null;
+      _pxPerFt = null;
       _measuredFeet = null;
       _mode = MeasureMode.calibrate;
       _knownLengthFt.text = '4.0';
+      _dragging = _Handle.none;
     });
-    _show('Reset. Tap two points to calibrate.');
+    _snack('Reset. Calibrate again.');
   }
 
-  void _show(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
+  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  // ---------- UI ----------
 
   @override
   Widget build(BuildContext context) {
-    final hasSize = _imageSize != null;
     final imgW = _imageSize?.width ?? 400;
     final imgH = _imageSize?.height ?? 300;
 
@@ -165,46 +233,45 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       appBar: AppBar(
         title: const Text('Measure Depth'),
         actions: [
-          IconButton(
-            tooltip: 'Reset',
-            onPressed: _resetAll,
-            icon: const Icon(Icons.refresh),
-          ),
+          IconButton(onPressed: _resetAll, tooltip: 'Reset', icon: const Icon(Icons.refresh)),
         ],
       ),
       body: Column(
         children: [
-          // Full-width canvas with no cropping.
+          // Full image, no cropping; overlay shares exact canvas size.
           Expanded(
             child: Center(
               child: FittedBox(
                 fit: BoxFit.contain,
                 child: SizedBox(
-                  width: imgW,
-                  height: imgH,
-                  child: Stack(
-                    children: [
-                      Positioned.fill(
-                        child: Image.file(
-                          widget.imageFile,
-                          fit: BoxFit.fill, // fill the SizedBox intrinsic canvas
-                        ),
-                      ),
-                      Positioned.fill(
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTapDown: hasSize ? _onTapDown : null,
-                          child: CustomPaint(
-                            painter: _OverlayPainter(
-                              calibA: _calibA,
-                              calibB: _calibB,
-                              measA: _measA,
-                              measB: _measB,
+                  width: imgW, height: imgH,
+                  child: Listener( // ensures gesture coords are in this box
+                    behavior: HitTestBehavior.deferToChild,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: _onTapDown,
+                      onPanStart: _onPanStart,
+                      onPanUpdate: _onPanUpdate,
+                      onPanEnd: _onPanEnd,
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                          ),
+                          Positioned.fill(
+                            child: CustomPaint(
+                              painter: _OverlayPainter(
+                                calibA: _calibA, calibB: _calibB,
+                                measA: _measA,   measB: _measB,
+                                dotRadius: _dotRadius,
+                                haloRadius: _haloRadius,
+                                stroke: _stroke,
+                              ),
                             ),
                           ),
-                        ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -227,7 +294,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                       onSelectionChanged: (s) => setState(() => _mode = s.first),
                     ),
                     const SizedBox(width: 12),
-                    if (_mode == MeasureMode.calibrate)
+                    if (_mode == MeasureMode.calibrate) ...[
                       Expanded(
                         child: TextField(
                           controller: _knownLengthFt,
@@ -239,62 +306,36 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                           ),
                         ),
                       ),
-                    const SizedBox(width: 8),
-                    if (_mode == MeasureMode.calibrate)
+                      const SizedBox(width: 8),
                       FilledButton(
                         onPressed: _calibrationReady ? _setCalibration : null,
                         child: const Text('Set calibration'),
                       ),
+                    ],
                   ],
                 ),
 
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    Expanded(
-                      child: _infoTile(
-                        title: 'Calibration points',
-                        value: _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'),
-                        icon: Icons.tune,
-                      ),
-                    ),
+                    Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
                     const SizedBox(width: 8),
-                    Expanded(
-                      child: _infoTile(
-                        title: 'Pixels per ft',
-                        value: _pixelsPerFoot == null ? '--' : _pixelsPerFoot!.toStringAsFixed(1),
-                        icon: Icons.straighten,
-                      ),
-                    ),
+                    Expanded(child: _statTile('Pixels / ft', _pxPerFt == null ? '--' : _pxPerFt!.toStringAsFixed(1), Icons.straighten)),
                   ],
                 ),
-
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    Expanded(
-                      child: _infoTile(
-                        title: 'Measure points',
-                        value: _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'),
-                        icon: Icons.straighten_outlined,
-                      ),
-                    ),
+                    Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
                     const SizedBox(width: 8),
-                    Expanded(
-                      child: _infoTile(
-                        title: 'Depth (ft)',
-                        value: _measuredFeet == null ? '--' : _measuredFeet!.toStringAsFixed(2),
-                        icon: Icons.calculate,
-                      ),
-                    ),
+                    Expanded(child: _statTile('Depth (ft)', _measuredFeet == null ? '--' : _measuredFeet!.toStringAsFixed(2), Icons.calculate)),
                   ],
                 ),
-
                 const SizedBox(height: 10),
                 Row(
                   children: [
                     OutlinedButton.icon(
-                      onPressed: _measurementReady ? _computeMeasurement : null,
+                      onPressed: _measurementReady ? _compute : null,
                       icon: const Icon(Icons.calculate),
                       label: const Text('Compute depth'),
                     ),
@@ -314,7 +355,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     );
   }
 
-  Widget _infoTile({required String title, required String value, required IconData icon}) {
+  Widget _statTile(String title, String value, IconData icon) {
     final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.all(12),
@@ -342,25 +383,21 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
 }
 
 class _OverlayPainter extends CustomPainter {
-  final Offset? calibA;
-  final Offset? calibB;
-  final Offset? measA;
-  final Offset? measB;
+  final Offset? calibA, calibB, measA, measB;
+  final double dotRadius, haloRadius, stroke;
 
   _OverlayPainter({
     required this.calibA,
     required this.calibB,
     required this.measA,
     required this.measB,
+    required this.dotRadius,
+    required this.haloRadius,
+    required this.stroke,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    // Styles that stand out on any background
-    const double dotRadius = 10;         // bigger points
-    const double haloRadius = 14;        // white halo behind each point
-    const double strokeWidth = 5;        // thicker lines
-
     final whiteHalo = Paint()
       ..color = Colors.white
       ..style = PaintingStyle.fill
@@ -376,49 +413,49 @@ class _OverlayPainter extends CustomPainter {
       ..style = PaintingStyle.fill
       ..isAntiAlias = true;
 
+    final blueLineHalo = Paint()
+      ..color = Colors.white.withOpacity(0.9)
+      ..strokeWidth = stroke + 3
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
     final blueLine = Paint()
       ..color = const Color(0xFF1565C0)
-      ..strokeWidth = strokeWidth
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    final greenLineHalo = Paint()
+      ..color = Colors.white.withOpacity(0.9)
+      ..strokeWidth = stroke + 3
       ..strokeCap = StrokeCap.round
       ..isAntiAlias = true;
 
     final greenLine = Paint()
       ..color = const Color(0xFF2E7D32)
-      ..strokeWidth = strokeWidth
+      ..strokeWidth = stroke
       ..strokeCap = StrokeCap.round
       ..isAntiAlias = true;
 
-    // Helper to draw a point with halo
     void point(Offset? p, Paint color) {
       if (p == null) return;
-      canvas.drawCircle(p, haloRadius, whiteHalo); // halo
-      canvas.drawCircle(p, dotRadius, color);      // colored dot
+      canvas.drawCircle(p, haloRadius, whiteHalo);
+      canvas.drawCircle(p, dotRadius, color);
     }
 
-    // Calibration (blue)
+    // Calib (blue)
     point(calibA, blue);
     point(calibB, blue);
     if (calibA != null && calibB != null) {
-      // halo under line for contrast
-      final haloLine = Paint()
-        ..color = Colors.white.withOpacity(0.9)
-        ..strokeWidth = strokeWidth + 2
-        ..strokeCap = StrokeCap.round
-        ..isAntiAlias = true;
-      canvas.drawLine(calibA!, calibB!, haloLine);
+      canvas.drawLine(calibA!, calibB!, blueLineHalo);
       canvas.drawLine(calibA!, calibB!, blueLine);
     }
 
-    // Measurement (green)
+    // Measure (green)
     point(measA, green);
     point(measB, green);
     if (measA != null && measB != null) {
-      final haloLine = Paint()
-        ..color = Colors.white.withOpacity(0.9)
-        ..strokeWidth = strokeWidth + 2
-        ..strokeCap = StrokeCap.round
-        ..isAntiAlias = true;
-      canvas.drawLine(measA!, measB!, haloLine);
+      canvas.drawLine(measA!, measB!, greenLineHalo);
       canvas.drawLine(measA!, measB!, greenLine);
     }
   }
@@ -428,6 +465,9 @@ class _OverlayPainter extends CustomPainter {
     return old.calibA != calibA ||
         old.calibB != calibB ||
         old.measA != measA ||
-        old.measB != measB;
+        old.measB != measB ||
+        old.dotRadius != dotRadius ||
+        old.haloRadius != haloRadius ||
+        old.stroke != stroke;
   }
 }

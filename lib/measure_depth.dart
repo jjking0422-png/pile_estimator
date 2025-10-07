@@ -1,563 +1,473 @@
-// measure_depth_screen.dart
 import 'dart:io';
 import 'package:flutter/material.dart';
 
 class MeasureDepthScreen extends StatefulWidget {
-  const MeasureDepthScreen({
-    super.key,
-    required this.imageFile,
-    this.initialDepthInUnits,
-    this.unitsLabel = 'in', // e.g., "in", "cm", etc.
-  });
-
   final File imageFile;
-  final double? initialDepthInUnits;
-  final String unitsLabel;
+  const MeasureDepthScreen({super.key, required this.imageFile});
 
   @override
   State<MeasureDepthScreen> createState() => _MeasureDepthScreenState();
 }
 
+enum MeasureMode { calibrate, measure }
+enum _Handle { none, calibA, calibB, measA, measB }
+
 class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
-  /// Points are stored in *display* coordinates (the size the image is drawn on screen),
-  /// so the painter and hit-testing are straightforward. If you need original
-  /// image-pixel coordinates later, you can map using [_displayToImageSpace].
-  Offset? p1;
-  Offset? p2;
+  final TextEditingController _knownLengthFt = TextEditingController(text: '4.0');
 
-  /// While drag-creating: after first tap, user can drag to place p2.
-  bool _isDragCreating = false;
+  MeasureMode _mode = MeasureMode.calibrate;
 
-  /// Editing state: which handle (if any) is being dragged.
-  int? _draggingHandleIndex; // 0 for p1, 1 for p2
+  // Points in image-canvas coordinates
+  Offset? _calibA, _calibB, _measA, _measB;
 
-  /// Depth typed by the user (real-world distance between p1 and p2).
-  final TextEditingController _depthCtrl = TextEditingController();
+  // Drag state
+  _Handle _dragging = _Handle.none;
 
-  /// Cached layout for the fitted image rect inside the available box.
-  Rect _imagePaintRect = Rect.zero;
+  // Calibration
+  double? _pxPerFt;
+  double? _measuredFeet;
 
-  /// Handle visual size (device pixels). Big and obvious as requested.
-  static const double _handleRadius = 10.0; // visual circle radius
-  static const double _touchRadius = 22.0; // larger hit target
+  // Intrinsic image size for exact canvas sizing
+  Size? _imageSize;
+
+  // Visual tuning
+  static const double _dotRadius = 18;     // doubled
+  static const double _haloRadius = 24;    // doubled
+  static const double _stroke = 10;        // doubled
+  static const double _hitRadius = 28;     // radius for grabbing a handle
+
+  bool get _calibrationReady => _calibA != null && _calibB != null;
+  bool get _measurementReady => _measA != null && _measB != null;
 
   @override
   void initState() {
     super.initState();
-    if (widget.initialDepthInUnits != null) {
-      _depthCtrl.text = widget.initialDepthInUnits!.toString();
-    }
+    _resolveImageSize();
   }
 
-  @override
-  void dispose() {
-    _depthCtrl.dispose();
-    super.dispose();
-  }
-
-  bool get _hasTwoPoints => p1 != null && p2 != null;
-
-  double? get _pixelDistance {
-    if (!_hasTwoPoints) return null;
-    return (p2! - p1!).distance;
-    // This is in display pixels (i.e., the size the image is painted).
-  }
-
-  /// If the user supplied a real-world depth, compute pixels-per-unit.
-  double? get _pixelsPerUnit {
-    final px = _pixelDistance;
-    final depth = double.tryParse(_depthCtrl.text.trim());
-    if (px == null || depth == null || depth == 0) return null;
-    return px / depth;
-  }
-
-  void _reset() {
-    setState(() {
-      p1 = null;
-      p2 = null;
-      _isDragCreating = false;
-      _draggingHandleIndex = null;
+  void _resolveImageSize() {
+    final provider = FileImage(widget.imageFile);
+    final stream = provider.resolve(const ImageConfiguration());
+    ImageStreamListener? listener;
+    listener = ImageStreamListener((info, _) {
+      setState(() {
+        _imageSize = Size(info.image.width.toDouble(), info.image.height.toDouble());
+      });
+      stream.removeListener(listener!);
+    }, onError: (e, st) {
+      setState(() => _imageSize = const Size(400, 300));
+      stream.removeListener(listener!);
     });
+    stream.addListener(listener);
   }
 
-  // Map a global/local position to clamped inside the painted image rect
-  Offset _clampToImage(Offset local) {
-    final dx = local.dx.clamp(_imagePaintRect.left, _imagePaintRect.right);
-    final dy = local.dy.clamp(_imagePaintRect.top, _imagePaintRect.bottom);
-    return Offset(dx.toDouble(), dy.toDouble());
+  // ---------- Gesture logic (tap + drag, adjustable endpoints) ----------
+
+  _Handle _hitTest(Offset p) {
+    double d(Offset? a) => a == null ? 1e9 : (p - a).distance;
+    final entries = <_Handle, double>{
+      _Handle.calibA: d(_calibA),
+      _Handle.calibB: d(_calibB),
+      _Handle.measA:  d(_measA),
+      _Handle.measB:  d(_measB),
+    };
+    _Handle best = _Handle.none;
+    double bestD = _hitRadius;
+    entries.forEach((h, dist) {
+      if (dist < bestD) {
+        bestD = dist;
+        best = h;
+      }
+    });
+    // Only allow dragging handles relevant to the current mode
+    if (_mode == MeasureMode.calibrate &&
+        (best == _Handle.measA || best == _Handle.measB)) return _Handle.none;
+    if (_mode == MeasureMode.measure &&
+        (best == _Handle.calibA || best == _Handle.calibB)) return _Handle.none;
+    return best;
   }
 
-  int? _hitTestHandle(Offset localPos) {
-    if (p1 != null &&
-        (localPos - p1!).distance <= _touchRadius) return 0;
-    if (p2 != null &&
-        (localPos - p2!).distance <= _touchRadius) return 1;
-    return null;
-  }
-
-  void _onTapDown(TapDownDetails d) {
-    final local = _clampToImage(d.localPosition);
-
-    // If handle tapped, start dragging that handle (editing mode)
-    final hit = _hitTestHandle(local);
-    if (hit != null) {
-      setState(() {
-        _draggingHandleIndex = hit;
-        _isDragCreating = false;
-      });
+  void _onPanStart(DragStartDetails d) {
+    final p = d.localPosition;
+    // Try to grab a nearby handle first
+    final grabbed = _hitTest(p);
+    if (grabbed != _Handle.none) {
+      setState(() => _dragging = grabbed);
       return;
     }
 
-    // If no points yet: set p1, start drag-create mode
-    if (p1 == null) {
-      setState(() {
-        p1 = local;
-        p2 = null;
-        _isDragCreating = true;
-      });
-      return;
-    }
-
-    // If only p1 is set: start drag-create for p2
-    if (p1 != null && p2 == null) {
-      setState(() {
-        _isDragCreating = true;
-        p2 = local;
-      });
-      return;
-    }
-
-    // If both exist and background tapped (not a handle), move the nearer one for convenience
-    if (_hasTwoPoints) {
-      final d1 = (local - p1!).distance;
-      final d2 = (local - p2!).distance;
-      setState(() {
-        if (d1 < d2) {
-          p1 = local;
-          _draggingHandleIndex = 0;
+    // Otherwise start laying out a new segment in the active mode
+    setState(() {
+      if (_mode == MeasureMode.calibrate) {
+        // Start new calibration line
+        if (_calibA == null || (_calibA != null && _calibB != null)) {
+          _calibA = p;
+          _calibB = p;      // live-drag to set B
+          _dragging = _Handle.calibB;
         } else {
-          p2 = local;
-          _draggingHandleIndex = 1;
+          // A is set, start dragging B
+          _calibB = p;
+          _dragging = _Handle.calibB;
         }
-        _isDragCreating = false;
-      });
-    }
+      } else {
+        if (_measA == null || (_measA != null && _measB != null)) {
+          _measA = p;
+          _measB = p;
+          _dragging = _Handle.measB;
+        } else {
+          _measB = p;
+          _dragging = _Handle.measB;
+        }
+      }
+    });
   }
 
   void _onPanUpdate(DragUpdateDetails d) {
-    final local = _clampToImage(d.localPosition);
-
-    // Drag-creating second point after first tap
-    if (_isDragCreating) {
-      setState(() {
-        p2 = local;
-      });
-      return;
-    }
-
-    // Editing an existing handle
-    if (_draggingHandleIndex == 0 && p1 != null) {
-      setState(() => p1 = local);
-      return;
-    }
-    if (_draggingHandleIndex == 1 && p2 != null) {
-      setState(() => p2 = local);
-      return;
-    }
+    if (_dragging == _Handle.none) return;
+    final p = d.localPosition;
+    setState(() {
+      switch (_dragging) {
+        case _Handle.calibA: _calibA = p; break;
+        case _Handle.calibB: _calibB = p; break;
+        case _Handle.measA:  _measA  = p; break;
+        case _Handle.measB:  _measB  = p; break;
+        case _Handle.none: break;
+      }
+    });
   }
 
   void _onPanEnd(DragEndDetails d) {
+    setState(() => _dragging = _Handle.none);
+  }
+
+  // Fallback tap (single taps without dragging)
+  void _onTapDown(TapDownDetails d) {
+    final p = d.localPosition;
     setState(() {
-      _isDragCreating = false;
-      _draggingHandleIndex = null;
+      if (_mode == MeasureMode.calibrate) {
+        if (_calibA == null) _calibA = p;
+        else if (_calibB == null) _calibB = p;
+        else { _calibA = p; _calibB = null; }
+      } else {
+        if (_measA == null) _measA = p;
+        else if (_measB == null) _measB = p;
+        else { _measA = p; _measB = null; }
+      }
     });
   }
 
-  void _onPanCancel() {
+  // ---------- Calc / flow ----------
+
+  double _dist(Offset a, Offset b) => (a - b).distance;
+
+  void _setCalibration() {
+    if (!_calibrationReady) {
+      _snack('Tap/drag two calibration points first.');
+      return;
+    }
+    final known = double.tryParse(_knownLengthFt.text);
+    if (known == null || known <= 0) {
+      _snack('Enter a valid known length (ft).');
+      return;
+    }
+    final px = _dist(_calibA!, _calibB!);
+    if (px <= 0) {
+      _snack('Calibration points overlap.');
+      return;
+    }
     setState(() {
-      _isDragCreating = false;
-      _draggingHandleIndex = null;
+      _pxPerFt = px / known;
+      _mode = MeasureMode.measure;
+      _measA = _measB = null;
+      _measuredFeet = null;
     });
+    _snack('Calibration set: ${_pxPerFt!.toStringAsFixed(2)} px/ft. Now measure.');
   }
 
-  // Optional: convert display-space point to image-pixel space
-  Offset _displayToImageSpace(Offset displayPt, Size rawImageSize) {
-    if (_imagePaintRect == Rect.zero) return Offset.zero;
-    final sx = (displayPt.dx - _imagePaintRect.left) / _imagePaintRect.width;
-    final sy = (displayPt.dy - _imagePaintRect.top) / _imagePaintRect.height;
-    return Offset(sx * rawImageSize.width, sy * rawImageSize.height);
+  void _compute() {
+    if (_pxPerFt == null) {
+      _snack('Set calibration first.');
+      return;
+    }
+    if (!_measurementReady) {
+      _snack('Place two measurement points (tap or drag).');
+      return;
+    }
+    final px = _dist(_measA!, _measB!);
+    final ft = px / _pxPerFt!;
+    setState(() => _measuredFeet = ft);
+    _snack('Depth = ${ft.toStringAsFixed(2)} ft');
   }
+
+  void _finish() {
+    final v = _measuredFeet;
+    if (v == null || v <= 0) {
+      _snack('No depth computed yet.');
+      return;
+    }
+    Navigator.of(context).pop<double>(v);
+  }
+
+  void _resetAll() {
+    setState(() {
+      _calibA = _calibB = _measA = _measB = null;
+      _pxPerFt = null;
+      _measuredFeet = null;
+      _mode = MeasureMode.calibrate;
+      _knownLengthFt.text = '4.0';
+      _dragging = _Handle.none;
+    });
+    _snack('Reset. Calibrate again.');
+  }
+
+  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  // ---------- UI ----------
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    final canConfirm =
-        _hasTwoPoints && double.tryParse(_depthCtrl.text.trim()) != null;
+    final imgW = _imageSize?.width ?? 400;
+    final imgH = _imageSize?.height ?? 300;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Measure Depth'),
         actions: [
-          IconButton(
-            tooltip: 'Reset',
-            onPressed: _reset,
-            icon: const Icon(Icons.refresh),
-          ),
+          IconButton(onPressed: _resetAll, tooltip: 'Reset', icon: const Icon(Icons.refresh)),
         ],
       ),
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          // We’ll compute the rect where the image will be painted with BoxFit.contain
-          // so our painter & hit testing align perfectly.
-          final maxW = constraints.maxWidth;
-          final maxH = constraints.maxHeight;
-
-          return FutureBuilder<Size>(
-            future: _getImageSize(widget.imageFile),
-            builder: (context, snap) {
-              if (!snap.hasData) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              final rawSize = snap.data!;
-              _imagePaintRect = _computeContainedImageRect(
-                container: Size(maxW, maxH),
-                image: rawSize,
-              );
-
-              return Column(
-                children: [
-                  // Top area: image with overlays
-                  Expanded(
-                    child: Center(
-                      child: SizedBox(
-                        width: _imagePaintRect.width,
-                        height: _imagePaintRect.height,
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            // The image (fits fully in frame)
-                            FittedBox(
-                              fit: BoxFit.contain,
-                              child: SizedBox(
-                                width: rawSize.width,
-                                height: rawSize.height,
-                                child: Image.file(
-                                  widget.imageFile,
-                                  fit: BoxFit.fill,
-                                ),
+      body: Column(
+        children: [
+          // Full image, no cropping; overlay shares exact canvas size.
+          Expanded(
+            child: Center(
+              child: FittedBox(
+                fit: BoxFit.contain,
+                child: SizedBox(
+                  width: imgW, height: imgH,
+                  child: Listener( // ensures gesture coords are in this box
+                    behavior: HitTestBehavior.deferToChild,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: _onTapDown,
+                      onPanStart: _onPanStart,
+                      onPanUpdate: _onPanUpdate,
+                      onPanEnd: _onPanEnd,
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                          ),
+                          Positioned.fill(
+                            child: CustomPaint(
+                              painter: _OverlayPainter(
+                                calibA: _calibA, calibB: _calibB,
+                                measA: _measA,   measB: _measB,
+                                dotRadius: _dotRadius,
+                                haloRadius: _haloRadius,
+                                stroke: _stroke,
                               ),
                             ),
-
-                            // Gesture layer lives in the *painted* rect coords
-                            GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onTapDown: _onTapDown,
-                              onPanUpdate: _onPanUpdate,
-                              onPanEnd: _onPanEnd,
-                              onPanCancel: _onPanCancel,
-                              child: CustomPaint(
-                                painter: _MeasurePainter(
-                                  p1: p1 == null
-                                      ? null
-                                      : p1! - _imagePaintRect.topLeft,
-                                  p2: p2 == null
-                                      ? null
-                                      : p2! - _imagePaintRect.topLeft,
-                                  handleRadius: _handleRadius,
-                                  drawRectSize: _imagePaintRect.size,
-                                ),
-                              ),
-                            ),
-
-                            // Place draggable handles (for accessibility and clarity)
-                            if (p1 != null)
-                              _HandleDot(
-                                center: p1! - _imagePaintRect.topLeft,
-                                onDragStart: () =>
-                                    setState(() => _draggingHandleIndex = 0),
-                                onDragUpdate: (local) {
-                                  // local is relative to image rect
-                                  final global = local + _imagePaintRect.topLeft;
-                                  setState(() => p1 = _clampToImage(global));
-                                },
-                                onDragEnd: () =>
-                                    setState(() => _draggingHandleIndex = null),
-                                handleRadius: _handleRadius,
-                              ),
-                            if (p2 != null)
-                              _HandleDot(
-                                center: p2! - _imagePaintRect.topLeft,
-                                onDragStart: () =>
-                                    setState(() => _draggingHandleIndex = 1),
-                                onDragUpdate: (local) {
-                                  final global = local + _imagePaintRect.topLeft;
-                                  setState(() => p2 = _clampToImage(global));
-                                },
-                                onDragEnd: () =>
-                                    setState(() => _draggingHandleIndex = null),
-                                handleRadius: _handleRadius,
-                              ),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
                     ),
                   ),
+                ),
+              ),
+            ),
+          ),
 
-                  // Bottom controls
-                  Padding(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        if (_pixelDistance != null)
-                          Padding(
-                            padding: const EdgeInsets.only(bottom: 8.0),
-                            child: Text(
-                              'Pixel distance: ${_pixelDistance!.toStringAsFixed(1)} px'
-                              '${_pixelsPerUnit == null ? '' : ' • ${_pixelsPerUnit!.toStringAsFixed(2)} px/${widget.unitsLabel}'}',
-                              style: theme.textTheme.bodyMedium,
-                            ),
-                          ),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _depthCtrl,
-                                keyboardType:
-                                    const TextInputType.numberWithOptions(
-                                        decimal: true, signed: false),
-                                decoration: InputDecoration(
-                                  labelText:
-                                      'Enter real depth (${widget.unitsLabel})',
-                                  hintText: 'e.g. 4.0',
-                                  border: const OutlineInputBorder(),
-                                ),
-                                onChanged: (_) => setState(() {}),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            FilledButton.icon(
-                              onPressed: canConfirm ? _confirmAndReturn : null,
-                              icon: const Icon(Icons.check),
-                              label: const Text('Use Depth'),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          _hasTwoPoints
-                              ? 'Tip: drag either handle to fine-tune. Tap elsewhere to quickly move the nearest handle.'
-                              : 'Tap to place the first point, then drag to the second. You can adjust afterward.',
-                          style: theme.textTheme.bodySmall
-                              ?.copyWith(color: theme.hintColor),
-                        ),
+          // Controls
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    SegmentedButton<MeasureMode>(
+                      segments: const [
+                        ButtonSegment(value: MeasureMode.calibrate, label: Text('Calibrate')),
+                        ButtonSegment(value: MeasureMode.measure, label: Text('Measure')),
                       ],
+                      selected: <MeasureMode>{_mode},
+                      onSelectionChanged: (s) => setState(() => _mode = s.first),
                     ),
-                  ),
-                ],
-              );
-            },
-          );
-        },
+                    const SizedBox(width: 12),
+                    if (_mode == MeasureMode.calibrate) ...[
+                      Expanded(
+                        child: TextField(
+                          controller: _knownLengthFt,
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                          decoration: const InputDecoration(
+                            labelText: 'Known length (ft)',
+                            border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: _calibrationReady ? _setCalibration : null,
+                        child: const Text('Set calibration'),
+                      ),
+                    ],
+                  ],
+                ),
+
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
+                    const SizedBox(width: 8),
+                    Expanded(child: _statTile('Pixels / ft', _pxPerFt == null ? '--' : _pxPerFt!.toStringAsFixed(1), Icons.straighten)),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
+                    const SizedBox(width: 8),
+                    Expanded(child: _statTile('Depth (ft)', _measuredFeet == null ? '--' : _measuredFeet!.toStringAsFixed(2), Icons.calculate)),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: _measurementReady ? _compute : null,
+                      icon: const Icon(Icons.calculate),
+                      label: const Text('Compute depth'),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: (_measuredFeet != null && _measuredFeet! > 0) ? _finish : null,
+                      icon: const Icon(Icons.check),
+                      label: const Text('Use depth'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  Future<Size> _getImageSize(File file) async {
-    final img = Image.file(file);
-    final comp = Completer<Size>();
-    img.image.resolve(const ImageConfiguration()).addListener(
-      ImageStreamListener((info, _) {
-        comp.complete(Size(
-          info.image.width.toDouble(),
-          info.image.height.toDouble(),
-        ));
-      }),
-    );
-    return comp.future;
-  }
-
-  Rect _computeContainedImageRect({
-    required Size container,
-    required Size image,
-  }) {
-    if (container.isEmpty || image.isEmpty) return Rect.zero;
-
-    final containerAspect = container.width / container.height;
-    final imageAspect = image.width / image.height;
-
-    double drawW, drawH;
-    if (imageAspect > containerAspect) {
-      // Limited by width
-      drawW = container.width;
-      drawH = drawW / imageAspect;
-    } else {
-      // Limited by height
-      drawH = container.height;
-      drawW = drawH * imageAspect;
-    }
-    final left = (container.width - drawW) / 2;
-    final top = (container.height - drawH) / 2;
-    return Rect.fromLTWH(left, top, drawW, drawH);
-  }
-
-  void _confirmAndReturn() {
-    if (!_hasTwoPoints) return;
-    final depth = double.tryParse(_depthCtrl.text.trim());
-    if (depth == null || depth <= 0) return;
-
-    final px = _pixelDistance!;
-    final pxPerUnit = px / depth;
-
-    // Map points to *image pixel space* in case caller wants that
-    // For now, we’ll return display-space too for convenience.
-    Navigator.of(context).pop<MeasureResult>(
-      MeasureResult(
-        point1Display: p1!,
-        point2Display: p2!,
-        pixelDistanceDisplay: px,
-        unitsLabel: widget.unitsLabel,
-        realDepth: depth,
-        pixelsPerUnit: pxPerUnit,
+  Widget _statTile(String title, String value, IconData icon) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceVariant,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: theme.textTheme.labelMedium),
+                Text(value, style: theme.textTheme.titleMedium),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-/// Return object you can catch from Navigator.pop
-class MeasureResult {
-  MeasureResult({
-    required this.point1Display,
-    required this.point2Display,
-    required this.pixelDistanceDisplay,
-    required this.unitsLabel,
-    required this.realDepth,
-    required this.pixelsPerUnit,
+class _OverlayPainter extends CustomPainter {
+  final Offset? calibA, calibB, measA, measB;
+  final double dotRadius, haloRadius, stroke;
+
+  _OverlayPainter({
+    required this.calibA,
+    required this.calibB,
+    required this.measA,
+    required this.measB,
+    required this.dotRadius,
+    required this.haloRadius,
+    required this.stroke,
   });
-
-  final Offset point1Display;
-  final Offset point2Display;
-  final double pixelDistanceDisplay;
-  final String unitsLabel;
-  final double realDepth;
-  final double pixelsPerUnit;
-}
-
-/// Painter draws the line and bold handles without needing extra state.
-/// Points provided should be in the painter's local space (top-left = 0,0).
-class _MeasurePainter extends CustomPainter {
-  _MeasurePainter({
-    required this.p1,
-    required this.p2,
-    required this.handleRadius,
-    required this.drawRectSize,
-  });
-
-  final Offset? p1;
-  final Offset? p2;
-  final double handleRadius;
-  final Size drawRectSize;
 
   @override
   void paint(Canvas canvas, Size size) {
-    // size should equal drawRectSize
-    final linePaint = Paint()
+    final whiteHalo = Paint()
       ..color = Colors.white
-      ..strokeWidth = 3
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-    final lineShadow = Paint()
-      ..color = Colors.black.withOpacity(0.35)
-      ..strokeWidth = 6
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
+    final blue = Paint()
+      ..color = const Color(0xFF1565C0)
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-    final fill = Paint()..color = Colors.orangeAccent;
-    final stroke = Paint()
-      ..color = Colors.black
-      ..strokeWidth = 2
-      ..style = PaintingStyle.stroke;
+    final green = Paint()
+      ..color = const Color(0xFF2E7D32)
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true;
 
-    if (p1 != null && p2 != null) {
-      // shadow under the line for visibility on bright photos
-      canvas.drawLine(p1!, p2!, lineShadow);
-      canvas.drawLine(p1!, p2!, linePaint);
+    final blueLineHalo = Paint()
+      ..color = Colors.white.withOpacity(0.9)
+      ..strokeWidth = stroke + 3
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
 
-      // midpoint tick
-      final mid = Offset(
-        (p1!.dx + p2!.dx) / 2,
-        (p1!.dy + p2!.dy) / 2,
-      );
-      canvas.drawCircle(mid, handleRadius * 0.5, fill);
-      canvas.drawCircle(mid, handleRadius * 0.5, stroke);
+    final blueLine = Paint()
+      ..color = const Color(0xFF1565C0)
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    final greenLineHalo = Paint()
+      ..color = Colors.white.withOpacity(0.9)
+      ..strokeWidth = stroke + 3
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    final greenLine = Paint()
+      ..color = const Color(0xFF2E7D32)
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.round
+      ..isAntiAlias = true;
+
+    void point(Offset? p, Paint color) {
+      if (p == null) return;
+      canvas.drawCircle(p, haloRadius, whiteHalo);
+      canvas.drawCircle(p, dotRadius, color);
     }
 
-    if (p1 != null) {
-      canvas.drawCircle(p1!, handleRadius, fill);
-      canvas.drawCircle(p1!, handleRadius, stroke);
+    // Calib (blue)
+    point(calibA, blue);
+    point(calibB, blue);
+    if (calibA != null && calibB != null) {
+      canvas.drawLine(calibA!, calibB!, blueLineHalo);
+      canvas.drawLine(calibA!, calibB!, blueLine);
     }
-    if (p2 != null) {
-      canvas.drawCircle(p2!, handleRadius, fill);
-      canvas.drawCircle(p2!, handleRadius, stroke);
+
+    // Measure (green)
+    point(measA, green);
+    point(measB, green);
+    if (measA != null && measB != null) {
+      canvas.drawLine(measA!, measB!, greenLineHalo);
+      canvas.drawLine(measA!, measB!, greenLine);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _MeasurePainter old) {
-    return old.p1 != p1 ||
-        old.p2 != p2 ||
-        old.handleRadius != handleRadius ||
-        old.drawRectSize != drawRectSize;
-  }
-}
-
-/// Big, friendly drag handle that lives inside the painted image rect.
-class _HandleDot extends StatelessWidget {
-  const _HandleDot({
-    required this.center,
-    required this.onDragStart,
-    required this.onDragUpdate,
-    required this.onDragEnd,
-    required this.handleRadius,
-  });
-
-  final Offset center; // local to the painted image rect
-  final VoidCallback onDragStart;
-  final ValueChanged<Offset> onDragUpdate; // local coords
-  final VoidCallback onDragEnd;
-  final double handleRadius;
-
-  @override
-  Widget build(BuildContext context) {
-    return Positioned(
-      left: center.dx - handleRadius,
-      top: center.dy - handleRadius,
-      child: GestureDetector(
-        behavior: HitTestBehavior.translucent,
-        onPanStart: (_) => onDragStart(),
-        onPanUpdate: (d) =>
-            onDragUpdate(Offset(center.dx + d.delta.dx, center.dy + d.delta.dy)),
-        onPanEnd: (_) => onDragEnd(),
-        child: Container(
-          width: handleRadius * 2,
-          height: handleRadius * 2,
-          decoration: BoxDecoration(
-            color: Colors.orangeAccent,
-            shape: BoxShape.circle,
-            boxShadow: const [
-              BoxShadow(
-                blurRadius: 4,
-                offset: Offset(0, 2),
-                color: Colors.black26,
-              ),
-            ],
-            border: Border.all(color: Colors.black, width: 2),
-          ),
-        ),
-      ),
-    );
+  bool shouldRepaint(covariant _OverlayPainter old) {
+    return old.calibA != calibA ||
+        old.calibB != calibB ||
+        old.measA != measA ||
+        old.measB != measB ||
+        old.dotRadius != dotRadius ||
+        old.haloRadius != haloRadius ||
+        old.stroke != stroke;
   }
 }

@@ -162,7 +162,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     setState(() => _dragging = _Handle.none);
   }
 
-  // QoL: tap a handle to "arm" it (so the next drag moves it), otherwise place/move nearest point
+  // Tap: if on a handle, arm it for drag; otherwise place or move nearest
   void _onTapDown(TapDownDetails d) {
     if (_activePointers >= 2) return;
     final p = d.localPosition;
@@ -175,18 +175,32 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
     setState(() {
       if (_mode == MeasureMode.calibrate) {
-        if (_calibA == null) _calibA = p;
-        else if (_calibB == null) _calibB = p;
-        else {
-          final dA = (_calibA! - p).distance, dB = (_calibB! - p).distance;
-          (_calibA!, _calibB!) = dA <= dB ? (p, _calibB!) : (_calibA!, p);
+        if (_calibA == null) {
+          _calibA = p;
+        } else if (_calibB == null) {
+          _calibB = p;
+        } else {
+          final dA = (_calibA! - p).distance;
+          final dB = (_calibB! - p).distance;
+          if (dA <= dB) {
+            _calibA = p;
+          } else {
+            _calibB = p;
+          }
         }
       } else {
-        if (_measA == null) _measA = p;
-        else if (_measB == null) _measB = p;
-        else {
-          final dA = (_measA! - p).distance, dB = (_measB! - p).distance;
-          (_measA!, _measB!) = dA <= dB ? (p, _measB!) : (_measA!, p);
+        if (_measA == null) {
+          _measA = p;
+        } else if (_measB == null) {
+          _measB = p;
+        } else {
+          final dA = (_measA! - p).distance;
+          final dB = (_measB! - p).distance;
+          if (dA <= dB) {
+            _measA = p;
+          } else {
+            _measB = p;
+          }
         }
       }
     });
@@ -196,12 +210,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
-    if (!_calibrationReady) return _snack('Tap/drag two calibration points first.');
+    if (!_calibrationReady) { _snack('Tap/drag two calibration points first.'); return; }
     final known = double.tryParse(_knownLengthFt.text);
-    if (known == null || known <= 0) return _snack('Enter a valid known length (ft).');
+    if (known == null || known <= 0) { _snack('Enter a valid known length (ft).'); return; }
 
     final px = _dist(_calibA!, _calibB!);
-    if (px <= 0) return _snack('Calibration points overlap.');
+    if (px <= 0) { _snack('Calibration points overlap.'); return; }
 
     setState(() {
       _pxPerFt = px / known;
@@ -213,8 +227,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _compute() {
-    if (_pxPerFt == null) return _snack('Set calibration first.');
-    if (!_measurementReady) return _snack('Place two measurement points (tap or drag).');
+    if (_pxPerFt == null) { _snack('Set calibration first.'); return; }
+    if (!_measurementReady) { _snack('Place two measurement points (tap or drag).'); return; }
 
     final ft = _dist(_measA!, _measB!) / _pxPerFt!;
     setState(() => _measuredFeet = ft);
@@ -222,7 +236,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _finish() {
-    if (_measuredFeet == null || _measuredFeet! <= 0) return _snack('No depth computed yet.');
+    if (_measuredFeet == null || _measuredFeet! <= 0) { _snack('No depth computed yet.'); return; }
     Navigator.of(context).pop<double>(_measuredFeet!);
   }
 
@@ -285,8 +299,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                 transformationController: _xfm,
                 minScale: 1.0,
                 maxScale: 10.0,
-                scaleEnabled: true,            // <— always allow pinch-scale
-                panEnabled: _isZoomed,         // <— only pan when zoomed in (no drift at 1×)
+                scaleEnabled: true,            // pinch zoom always allowed
+                panEnabled: _isZoomed,         // only pan when zoomed (prevents drift at 1x)
                 boundaryMargin: EdgeInsets.zero,
                 clipBehavior: Clip.hardEdge,
                 child: SizedBox(

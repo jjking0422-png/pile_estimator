@@ -14,13 +14,12 @@ class MeasureDepthScreen extends StatefulWidget {
 enum MeasureMode { calibrate, measure }
 enum _Handle { none, calibA, calibB, measA, measB }
 
-class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
-  final TextEditingController _knownLengthFt =
-      TextEditingController(text: '4.0');
+class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProviderStateMixin {
+  final TextEditingController _knownLengthFt = TextEditingController(text: '4.0');
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Points in image-canvas coordinates
+  // Points in image-canvas coordinates (i.e., the unscaled child size)
   Offset? _calibA, _calibB, _measA, _measB;
 
   // Drag state
@@ -33,20 +32,34 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   // Intrinsic image size for exact canvas sizing
   Size? _imageSize;
 
-  // Visual tuning (kept doubled)
-  static const double _dotRadius = 18; // doubled
-  static const double _haloRadius = 24; // doubled
-  static const double _stroke = 10; // doubled
-  static const double _hitRadius = 28; // for grabbing a handle
-  static const double _midTickR = 8;
+  // ===== Visual tuning (now 5× larger) =====
+  static const double _dotRadius = 18 * 5;   // was 18
+  static const double _haloRadius = 24 * 5;  // was 24
+  static const double _stroke = 10 * 5;      // was 10
+  static const double _hitRadius = 28 * 5;   // grab radius
+  static const double _midTickR = 8 * 5;     // midpoint marker
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
 
+  // ===== Zoom / Pan =====
+  late final TransformationController _xfm;
+  Animation<Matrix4>? _zoomAnim;
+  AnimationController? _animCtrl;
+
   @override
   void initState() {
     super.initState();
+    _xfm = TransformationController();
     _resolveImageSize();
+  }
+
+  @override
+  void dispose() {
+    _animCtrl?.dispose();
+    _xfm.dispose();
+    _knownLengthFt.dispose();
+    super.dispose();
   }
 
   void _resolveImageSize() {
@@ -56,8 +69,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     listener = ImageStreamListener((info, _) {
       if (!mounted) return;
       setState(() {
-        _imageSize = Size(info.image.width.toDouble(),
-            info.image.height.toDouble());
+        _imageSize = Size(info.image.width.toDouble(), info.image.height.toDouble());
       });
       stream.removeListener(listener!);
     }, onError: (e, st) {
@@ -75,8 +87,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     final entries = <_Handle, double>{
       _Handle.calibA: d(_calibA),
       _Handle.calibB: d(_calibB),
-      _Handle.measA: d(_measA),
-      _Handle.measB: d(_measB),
+      _Handle.measA:  d(_measA),
+      _Handle.measB:  d(_measB),
     };
     _Handle best = _Handle.none;
     double bestD = _hitRadius;
@@ -95,6 +107,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
   }
 
   void _onPanStart(DragStartDetails d) {
+    // d.localPosition is already in the child (image) coordinate system,
+    // even when zoomed, because InteractiveViewer maps events to the child.
     final p = d.localPosition;
 
     // Try to grab a nearby handle first
@@ -108,13 +122,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     // Otherwise start laying out a new segment in the active mode
     setState(() {
       if (_mode == MeasureMode.calibrate) {
-        // Start new calibration line
         if (_calibA == null || (_calibA != null && _calibB != null)) {
           _calibA = p;
-          _calibB = p; // live-drag to set B
+          _calibB = p;      // live-drag to set B
           _dragging = _Handle.calibB;
         } else {
-          // A is set, start dragging B
           _calibB = p;
           _dragging = _Handle.calibB;
         }
@@ -136,20 +148,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     final p = d.localPosition;
     setState(() {
       switch (_dragging) {
-        case _Handle.calibA:
-          _calibA = p;
-          break;
-        case _Handle.calibB:
-          _calibB = p;
-          break;
-        case _Handle.measA:
-          _measA = p;
-          break;
-        case _Handle.measB:
-          _measB = p;
-          break;
-        case _Handle.none:
-          break;
+        case _Handle.calibA: _calibA = p; break;
+        case _Handle.calibB: _calibB = p; break;
+        case _Handle.measA:  _measA  = p; break;
+        case _Handle.measB:  _measB  = p; break;
+        case _Handle.none: break;
       }
     });
   }
@@ -158,53 +161,35 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     setState(() => _dragging = _Handle.none);
   }
 
-  // Taps that aren’t drags:
-  // - If tap lands on a handle, we’ll pick it up in _onPanStart anyway.
-  // - If tap lands on background: move nearest handle for the ACTIVE mode (quality-of-life).
+  // Background tap quality-of-life:
+  // If tap doesn't hit a handle, move the nearest handle in the ACTIVE mode.
   void _onTapDown(TapDownDetails d) {
     final p = d.localPosition;
-
-    // If any handle is within hit radius, let pan logic handle it; otherwise, move nearest active handle.
     final grabbed = _hitTest(p);
     if (grabbed != _Handle.none) return;
 
     setState(() {
       if (_mode == MeasureMode.calibrate) {
-        // If no points yet, place A then B
-        if (_calibA == null) {
-          _calibA = p;
-        } else if (_calibB == null) {
-          _calibB = p;
-        } else {
-          // Move the nearer of A/B
+        if (_calibA == null) _calibA = p;
+        else if (_calibB == null) _calibB = p;
+        else {
           final dA = (_calibA! - p).distance;
           final dB = (_calibB! - p).distance;
-          if (dA <= dB) {
-            _calibA = p;
-          } else {
-            _calibB = p;
-          }
+          if (dA <= dB) _calibA = p; else _calibB = p;
         }
       } else {
-        if (_measA == null) {
-          _measA = p;
-        } else if (_measB == null) {
-          _measB = p;
-        } else {
+        if (_measA == null) _measA = p;
+        else if (_measB == null) _measB = p;
+        else {
           final dA = (_measA! - p).distance;
           final dB = (_measB! - p).distance;
-          if (dA <= dB) {
-            _measA = p;
-          } else {
-            _measB = p;
-          }
+          if (dA <= dB) _measA = p; else _measB = p;
         }
       }
     });
   }
 
   // ---------- Calc / flow ----------
-
   double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
@@ -228,8 +213,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       _measA = _measB = null;
       _measuredFeet = null;
     });
-    _snack(
-        'Calibration set: ${_pxPerFt!.toStringAsFixed(2)} px/ft. Switch to Measure and place two points.');
+    _snack('Calibration set: ${_pxPerFt!.toStringAsFixed(2)} px/ft. Now measure.');
   }
 
   void _compute() {
@@ -268,11 +252,38 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
     _snack('Reset. Calibrate again.');
   }
 
-  void _snack(String m) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  // ===== Zoom helpers =====
+  void _animateTo(Matrix4 target) {
+    _animCtrl?.dispose();
+    _animCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 180));
+    _zoomAnim = Matrix4Tween(begin: _xfm.value, end: target).animate(
+      CurvedAnimation(parent: _animCtrl!, curve: Curves.easeOutCubic),
+    )..addListener(() => setState(() => _xfm.value = _zoomAnim!.value));
+    _animCtrl!.forward();
+  }
+
+  void _resetZoom() => _animateTo(Matrix4.identity());
+
+  // Double-tap: smart zoom in/out centered on tap location
+  void _onDoubleTapDown(TapDownDetails d, Size childSize) {
+    final currentScale = _xfm.value.getMaxScaleOnAxis();
+    final targetScale = currentScale < 2.0 ? 2.5 : 1.0;
+
+    // Compute a matrix that zooms around the tap (scene) point
+    final focal = d.localPosition; // already in scene coords
+    final m = Matrix4.identity();
+
+    // Translate focal to origin, scale, translate back + keep current pan
+    m.translate(focal.dx, focal.dy);
+    m.multiply(Matrix4.diagonal3Values(targetScale, targetScale, 1));
+    m.translate(-focal.dx, -focal.dy);
+
+    _animateTo(m);
+  }
 
   // ---------- UI ----------
-
   @override
   Widget build(BuildContext context) {
     final imgW = _imageSize?.width ?? 400;
@@ -282,55 +293,78 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
       appBar: AppBar(
         title: const Text('Measure Depth'),
         actions: [
-          IconButton(
-              onPressed: _resetAll,
-              tooltip: 'Reset',
-              icon: const Icon(Icons.refresh)),
+          IconButton(onPressed: _resetAll, tooltip: 'Reset points', icon: const Icon(Icons.refresh)),
         ],
       ),
       body: Column(
         children: [
-          // Full image, no cropping; overlay shares exact canvas size.
+          // Zoomable image with overlay. The GestureDetector lives INSIDE the InteractiveViewer,
+          // so its localPosition is in the unscaled child coordinate space.
           Expanded(
             child: Center(
-              child: FittedBox(
-                fit: BoxFit.contain,
-                child: SizedBox(
-                  width: imgW,
-                  height: imgH,
-                  child: Listener(
-                    behavior: HitTestBehavior.deferToChild,
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTapDown: _onTapDown,
-                      onPanStart: _onPanStart,
-                      onPanUpdate: _onPanUpdate,
-                      onPanEnd: _onPanEnd,
-                      child: Stack(
-                        children: [
-                          Positioned.fill(
-                            child: Image.file(widget.imageFile,
-                                fit: BoxFit.fill),
-                          ),
-                          Positioned.fill(
-                            child: CustomPaint(
-                              painter: _OverlayPainter(
-                                calibA: _calibA,
-                                calibB: _calibB,
-                                measA: _measA,
-                                measB: _measB,
-                                dotRadius: _dotRadius,
-                                haloRadius: _haloRadius,
-                                stroke: _stroke,
-                                midTickR: _midTickR,
-                              ),
+              child: LayoutBuilder(
+                builder: (context, _) {
+                  final childSize = Size(imgW, imgH);
+                  return Stack(
+                    children: [
+                      InteractiveViewer(
+                        transformationController: _xfm,
+                        minScale: 1.0,
+                        maxScale: 10.0,
+                        panEnabled: true,
+                        scaleEnabled: true,
+                        boundaryMargin: const EdgeInsets.all(200),
+                        clipBehavior: Clip.none,
+                        child: SizedBox(
+                          width: childSize.width,
+                          height: childSize.height,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTapDown: _onTapDown,
+                            onPanStart: _onPanStart,
+                            onPanUpdate: _onPanUpdate,
+                            onPanEnd: _onPanEnd,
+                            onDoubleTapDown: (d) => _onDoubleTapDown(d, childSize),
+                            onDoubleTap: () {}, // handled in onDoubleTapDown
+                            child: Stack(
+                              children: [
+                                Positioned.fill(
+                                  child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                                ),
+                                Positioned.fill(
+                                  child: CustomPaint(
+                                    painter: _OverlayPainter(
+                                      calibA: _calibA, calibB: _calibB,
+                                      measA: _measA,   measB: _measB,
+                                      dotRadius: _dotRadius,
+                                      haloRadius: _haloRadius,
+                                      stroke: _stroke,
+                                      midTickR: _midTickR,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                        ],
+                        ),
                       ),
-                    ),
-                  ),
-                ),
+                      // Zoom controls (floating, non-intrusive)
+                      Positioned(
+                        right: 12,
+                        bottom: 12,
+                        child: Column(
+                          children: [
+                            _ZoomFab(
+                              icon: Icons.zoom_out_map,
+                              tooltip: 'Reset zoom',
+                              onTap: _resetZoom,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
               ),
             ),
           ),
@@ -344,29 +378,22 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                   children: [
                     SegmentedButton<MeasureMode>(
                       segments: const [
-                        ButtonSegment(
-                            value: MeasureMode.calibrate,
-                            label: Text('Calibrate')),
-                        ButtonSegment(
-                            value: MeasureMode.measure, label: Text('Measure')),
+                        ButtonSegment(value: MeasureMode.calibrate, label: Text('Calibrate')),
+                        ButtonSegment(value: MeasureMode.measure,   label: Text('Measure')),
                       ],
                       selected: <MeasureMode>{_mode},
-                      onSelectionChanged: (s) =>
-                          setState(() => _mode = s.first),
+                      onSelectionChanged: (s) => setState(() => _mode = s.first),
                     ),
                     const SizedBox(width: 12),
                     if (_mode == MeasureMode.calibrate) ...[
                       Expanded(
                         child: TextField(
                           controller: _knownLengthFt,
-                          keyboardType:
-                              const TextInputType.numberWithOptions(
-                                  decimal: true),
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true),
                           decoration: const InputDecoration(
                             labelText: 'Known length (ft)',
                             border: OutlineInputBorder(),
-                            contentPadding: EdgeInsets.symmetric(
-                                horizontal: 12, vertical: 10),
+                            contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                           ),
                         ),
                       ),
@@ -378,45 +405,20 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                     ],
                   ],
                 ),
-
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    Expanded(
-                        child: _statTile(
-                            'Calibration pts',
-                            _calibrationReady
-                                ? '2/2 ✓'
-                                : (_calibA == null ? '0/2' : '1/2'),
-                            Icons.tune)),
+                    Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
                     const SizedBox(width: 8),
-                    Expanded(
-                        child: _statTile(
-                            'Pixels / ft',
-                            _pxPerFt == null
-                                ? '--'
-                                : _pxPerFt!.toStringAsFixed(1),
-                            Icons.straighten)),
+                    Expanded(child: _statTile('Pixels / ft', _pxPerFt == null ? '--' : _pxPerFt!.toStringAsFixed(1), Icons.straighten)),
                   ],
                 ),
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    Expanded(
-                        child: _statTile(
-                            'Measure pts',
-                            _measurementReady
-                                ? '2/2 ✓'
-                                : (_measA == null ? '0/2' : '1/2'),
-                            Icons.straighten_outlined)),
+                    Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
                     const SizedBox(width: 8),
-                    Expanded(
-                        child: _statTile(
-                            'Depth (ft)',
-                            _measuredFeet == null
-                                ? '--'
-                                : _measuredFeet!.toStringAsFixed(2),
-                            Icons.calculate)),
+                    Expanded(child: _statTile('Depth (ft)', _measuredFeet == null ? '--' : _measuredFeet!.toStringAsFixed(2), Icons.calculate)),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -429,9 +431,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> {
                     ),
                     const SizedBox(width: 8),
                     FilledButton.icon(
-                      onPressed: (_measuredFeet != null && _measuredFeet! > 0)
-                          ? _finish
-                          : null,
+                      onPressed: (_measuredFeet != null && _measuredFeet! > 0) ? _finish : null,
                       icon: const Icon(Icons.check),
                       label: const Text('Use depth'),
                     ),
@@ -539,9 +539,7 @@ class _OverlayPainter extends CustomPainter {
       // midpoint tick
       final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
       final midFill = Paint()
-        ..color = (line == blueLine)
-            ? const Color(0xFF1565C0)
-            : const Color(0xFF2E7D32)
+        ..color = (line == blueLine) ? const Color(0xFF1565C0) : const Color(0xFF2E7D32)
         ..style = PaintingStyle.fill
         ..isAntiAlias = true;
       final midStroke = Paint()
@@ -574,5 +572,32 @@ class _OverlayPainter extends CustomPainter {
         old.haloRadius != haloRadius ||
         old.stroke != stroke ||
         old.midTickR != midTickR;
+  }
+}
+
+class _ZoomFab extends StatelessWidget {
+  const _ZoomFab({required this.icon, required this.tooltip, required this.onTap});
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      elevation: 2,
+      shape: const CircleBorder(),
+      color: Theme.of(context).colorScheme.surface,
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Tooltip(
+            message: tooltip,
+            child: Icon(icon, size: 22),
+          ),
+        ),
+      ),
+    );
   }
 }

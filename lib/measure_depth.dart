@@ -21,7 +21,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Points in image-canvas coordinates (the unscaled child space)
+  // Points in image-canvas coordinates (unscaled child space)
   Offset? _calibA, _calibB, _measA, _measB;
 
   // Drag state
@@ -34,12 +34,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   // Intrinsic image size for exact canvas sizing
   Size? _imageSize;
 
-  // ===== Visual tuning (2× your earlier doubled version) =====
-  static const double _dotRadius = 18 * 2;
-  static const double _haloRadius = 24 * 2;
-  static const double _stroke = 10 * 2;
-  static const double _hitRadius = 28 * 2;
-  static const double _midTickR = 8 * 2;
+  // ===== Visual tuning (smaller + readable) =====
+  static const double _dotRadius = 16;   // marker dot
+  static const double _haloRadius = 20;  // white halo behind dot
+  static const double _stroke = 8;       // line thickness
+  static const double _hitRadius = 26;   // tap/drag grab radius
+  static const double _midTickR = 6;     // midpoint tick
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -359,10 +359,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                       // Single detector handles BOTH double-tap and single-tap/drag.
                       onDoubleTapDown: _onDoubleTapDown,
                       onDoubleTap: () {},
-                      onTapDown: _onTapDown,
-                      onPanStart: _onPanStart,
-                      onPanUpdate: _onPanUpdate,
-                      onPanEnd: _onPanEnd,
                       behavior: HitTestBehavior.opaque,
                       child: Stack(
                         children: [
@@ -370,17 +366,28 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                             child: Image.file(widget.imageFile,
                                 fit: BoxFit.fill),
                           ),
+                          // Absorb child gestures while pinching so InteractiveViewer gets full control.
                           Positioned.fill(
-                            child: CustomPaint(
-                              painter: _OverlayPainter(
-                                calibA: _calibA,
-                                calibB: _calibB,
-                                measA: _measA,
-                                measB: _measB,
-                                dotRadius: _dotRadius,
-                                haloRadius: _haloRadius,
-                                stroke: _stroke,
-                                midTickR: _midTickR,
+                            child: AbsorbPointer(
+                              absorbing: _activePointers >= 2,
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.translucent,
+                                onTapDown: _onTapDown,
+                                onPanStart: _onPanStart,
+                                onPanUpdate: _onPanUpdate,
+                                onPanEnd: _onPanEnd,
+                                child: CustomPaint(
+                                  painter: _OverlayPainter(
+                                    calibA: _calibA,
+                                    calibB: _calibB,
+                                    measA: _measA,
+                                    measB: _measB,
+                                    dotRadius: _dotRadius,
+                                    haloRadius: _haloRadius,
+                                    stroke: _stroke,
+                                    midTickR: _midTickR,
+                                  ),
+                                ),
                               ),
                             ),
                           ),
@@ -564,7 +571,7 @@ class _OverlayPainter extends CustomPainter {
 
     final lineHalo = Paint()
       ..color = Colors.black.withOpacity(0.35)
-      ..strokeWidth = stroke + 4
+      ..strokeWidth = stroke + 3
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke
       ..isAntiAlias = true;
@@ -597,9 +604,7 @@ class _OverlayPainter extends CustomPainter {
       // midpoint tick
       final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
       final midFill = Paint()
-        ..color = (line == blueLine)
-            ? const Color(0xFF1565C0)
-            : const Color(0xFF2E7D32)
+        ..color = (line == blueLine) ? const Color(0xFF1565C0) : const Color(0xFF2E7D32)
         ..style = PaintingStyle.fill
         ..isAntiAlias = true;
       final midStroke = Paint()

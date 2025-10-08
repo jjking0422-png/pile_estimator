@@ -34,12 +34,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   // Intrinsic image size for exact canvas sizing
   Size? _imageSize;
 
-  // ===== Visual tuning (2× the earlier "doubled" version) =====
-  static const double _dotRadius = 18 * 2;   // was 18 (after your first doubling)
-  static const double _haloRadius = 24 * 2;  // was 24
-  static const double _stroke = 10 * 2;      // was 10
-  static const double _hitRadius = 28 * 2;   // grab radius
-  static const double _midTickR = 8 * 2;     // midpoint marker
+  // ===== Visual tuning (2× your earlier doubled version) =====
+  static const double _dotRadius = 18 * 2;
+  static const double _haloRadius = 24 * 2;
+  static const double _stroke = 10 * 2;
+  static const double _hitRadius = 28 * 2;
+  static const double _midTickR = 8 * 2;
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -182,6 +182,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _onTapDown(TapDownDetails d) {
     if (_activePointers >= 2) return; // two-finger -> viewer owns gestures
     final p = d.localPosition;
+
+    // If this tap hits a handle, let _onPanStart pick it up on drag; otherwise place/move points
     final grabbed = _hitTest(p);
     if (grabbed != _Handle.none) return;
 
@@ -333,80 +335,60 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
           // Zoomable image with overlay.
           Expanded(
             child: Center(
-              child: Stack(
-                children: [
-                  InteractiveViewer(
-                    transformationController: _xfm,
-                    minScale: 1.0,
-                    maxScale: 10.0,
-                    // Enable zoom/pan ONLY when 2+ fingers are down.
-                    // Also, only allow panning if actually zoomed in.
-                    scaleEnabled: _activePointers >= 2,
-                    panEnabled: _activePointers >= 2 && _isZoomed,
-                    boundaryMargin: EdgeInsets.zero,
-                    clipBehavior: Clip.hardEdge,
-                    child: SizedBox(
-                      width: imgW,
-                      height: imgH,
-                      // Count pointers so we can disable handle-drag when pinching
-                      child: Listener(
-                        onPointerDown: (_) =>
-                            setState(() => _activePointers++),
-                        onPointerUp: (_) => setState(() =>
-                            _activePointers = (_activePointers - 1).clamp(0, 10)),
-                        onPointerCancel: (_) => setState(() =>
-                            _activePointers = (_activePointers - 1).clamp(0, 10)),
-                        child: GestureDetector(
-                          // Double-tap zoom
-                          onDoubleTapDown: _onDoubleTapDown,
-                          onDoubleTap: () {},
-                          behavior: HitTestBehavior.opaque,
-                          child: Stack(
-                            children: [
-                              Positioned.fill(
-                                child: Image.file(widget.imageFile,
-                                    fit: BoxFit.fill),
-                              ),
-                              // When 2+ fingers are on screen, give all gestures to the viewer
-                              AbsorbPointer(
-                                absorbing: _activePointers >= 2,
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onTapDown: _onTapDown,
-                                  onPanStart: _onPanStart,
-                                  onPanUpdate: _onPanUpdate,
-                                  onPanEnd: _onPanEnd,
-                                  child: CustomPaint(
-                                    painter: _OverlayPainter(
-                                      calibA: _calibA,
-                                      calibB: _calibB,
-                                      measA: _measA,
-                                      measB: _measB,
-                                      dotRadius: _dotRadius,
-                                      haloRadius: _haloRadius,
-                                      stroke: _stroke,
-                                      midTickR: _midTickR,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+              child: InteractiveViewer(
+                transformationController: _xfm,
+                minScale: 1.0,
+                maxScale: 10.0,
+                // Enable zoom/pan ONLY when 2+ fingers are down.
+                // Also, only allow panning if actually zoomed in.
+                scaleEnabled: _activePointers >= 2,
+                panEnabled: _activePointers >= 2 && _isZoomed,
+                boundaryMargin: EdgeInsets.zero,
+                clipBehavior: Clip.hardEdge,
+                child: SizedBox(
+                  width: imgW,
+                  height: imgH,
+                  child: Listener(
+                    onPointerDown: (_) =>
+                        setState(() => _activePointers++),
+                    onPointerUp: (_) => setState(() =>
+                        _activePointers = (_activePointers - 1).clamp(0, 10)),
+                    onPointerCancel: (_) => setState(() =>
+                        _activePointers = (_activePointers - 1).clamp(0, 10)),
+                    child: GestureDetector(
+                      // Single detector handles BOTH double-tap and single-tap/drag.
+                      onDoubleTapDown: _onDoubleTapDown,
+                      onDoubleTap: () {},
+                      onTapDown: _onTapDown,
+                      onPanStart: _onPanStart,
+                      onPanUpdate: _onPanUpdate,
+                      onPanEnd: _onPanEnd,
+                      behavior: HitTestBehavior.opaque,
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: Image.file(widget.imageFile,
+                                fit: BoxFit.fill),
                           ),
-                        ),
+                          Positioned.fill(
+                            child: CustomPaint(
+                              painter: _OverlayPainter(
+                                calibA: _calibA,
+                                calibB: _calibB,
+                                measA: _measA,
+                                measB: _measB,
+                                dotRadius: _dotRadius,
+                                haloRadius: _haloRadius,
+                                stroke: _stroke,
+                                midTickR: _midTickR,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),
-                  // Zoom reset button
-                  Positioned(
-                    right: 12,
-                    bottom: 12,
-                    child: _ZoomFab(
-                      icon: Icons.zoom_out_map,
-                      tooltip: 'Reset zoom',
-                      onTap: _resetZoom,
-                    ),
-                  ),
-                ],
+                ),
               ),
             ),
           ),
@@ -650,33 +632,5 @@ class _OverlayPainter extends CustomPainter {
         old.haloRadius != haloRadius ||
         old.stroke != stroke ||
         old.midTickR != midTickR;
-  }
-}
-
-class _ZoomFab extends StatelessWidget {
-  const _ZoomFab(
-      {required this.icon, required this.tooltip, required this.onTap});
-  final IconData icon;
-  final String tooltip;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      elevation: 2,
-      shape: const CircleBorder(),
-      color: Theme.of(context).colorScheme.surface,
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Tooltip(
-            message: tooltip,
-            child: Icon(icon, size: 22),
-          ),
-        ),
-      ),
-    );
   }
 }

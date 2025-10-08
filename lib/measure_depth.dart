@@ -19,7 +19,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Points in image-canvas coordinates (i.e., the unscaled child size)
+  // Points in image-canvas coordinates (the unscaled child space)
   Offset? _calibA, _calibB, _measA, _measB;
 
   // Drag state
@@ -32,12 +32,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
   // Intrinsic image size for exact canvas sizing
   Size? _imageSize;
 
-  // ===== Visual tuning (now 5× larger) =====
-  static const double _dotRadius = 18 * 5;   // was 18
-  static const double _haloRadius = 24 * 5;  // was 24
-  static const double _stroke = 10 * 5;      // was 10
-  static const double _hitRadius = 28 * 5;   // grab radius
-  static const double _midTickR = 8 * 5;     // midpoint marker
+  // ===== Visual tuning (2× the earlier “doubled” version) =====
+  static const double _dotRadius = 18 * 2;   // was 18 (doubled before); now 2× that
+  static const double _haloRadius = 24 * 2;  // was 24
+  static const double _stroke = 10 * 2;      // was 10
+  static const double _hitRadius = 28 * 2;   // grab radius
+  static const double _midTickR = 8 * 2;     // midpoint marker
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -46,6 +46,9 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
   late final TransformationController _xfm;
   Animation<Matrix4>? _zoomAnim;
   AnimationController? _animCtrl;
+
+  // Track active pointers so 2+ fingers hand control to InteractiveViewer
+  int _activePointers = 0;
 
   @override
   void initState() {
@@ -81,7 +84,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
   }
 
   // ---------- Gesture logic (tap + drag, adjustable endpoints) ----------
-
   _Handle _hitTest(Offset p) {
     double d(Offset? a) => a == null ? 1e9 : (p - a).distance;
     final entries = <_Handle, double>{
@@ -107,8 +109,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
   }
 
   void _onPanStart(DragStartDetails d) {
-    // d.localPosition is already in the child (image) coordinate system,
-    // even when zoomed, because InteractiveViewer maps events to the child.
     final p = d.localPosition;
 
     // Try to grab a nearby handle first
@@ -161,8 +161,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
     setState(() => _dragging = _Handle.none);
   }
 
-  // Background tap quality-of-life:
-  // If tap doesn't hit a handle, move the nearest handle in the ACTIVE mode.
+  // Background tap QoL: move the nearest active handle if you tap empty space
   void _onTapDown(TapDownDetails d) {
     final p = d.localPosition;
     final grabbed = _hitTest(p);
@@ -267,18 +266,15 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
   void _resetZoom() => _animateTo(Matrix4.identity());
 
   // Double-tap: smart zoom in/out centered on tap location
-  void _onDoubleTapDown(TapDownDetails d, Size childSize) {
+  void _onDoubleTapDown(TapDownDetails d) {
     final currentScale = _xfm.value.getMaxScaleOnAxis();
     final targetScale = currentScale < 2.0 ? 2.5 : 1.0;
 
-    // Compute a matrix that zooms around the tap (scene) point
-    final focal = d.localPosition; // already in scene coords
-    final m = Matrix4.identity();
-
-    // Translate focal to origin, scale, translate back + keep current pan
-    m.translate(focal.dx, focal.dy);
-    m.multiply(Matrix4.diagonal3Values(targetScale, targetScale, 1));
-    m.translate(-focal.dx, -focal.dy);
+    final focal = d.localPosition; // scene coords
+    final m = Matrix4.identity()
+      ..translate(focal.dx, focal.dy)
+      ..scale(targetScale)
+      ..translate(-focal.dx, -focal.dy);
 
     _animateTo(m);
   }
@@ -298,40 +294,46 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
       ),
       body: Column(
         children: [
-          // Zoomable image with overlay. The GestureDetector lives INSIDE the InteractiveViewer,
-          // so its localPosition is in the unscaled child coordinate space.
+          // Zoomable image with overlay.
           Expanded(
             child: Center(
-              child: LayoutBuilder(
-                builder: (context, _) {
-                  final childSize = Size(imgW, imgH);
-                  return Stack(
-                    children: [
-                      InteractiveViewer(
-                        transformationController: _xfm,
-                        minScale: 1.0,
-                        maxScale: 10.0,
-                        panEnabled: true,
-                        scaleEnabled: true,
-                        boundaryMargin: const EdgeInsets.all(200),
-                        clipBehavior: Clip.none,
-                        child: SizedBox(
-                          width: childSize.width,
-                          height: childSize.height,
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTapDown: _onTapDown,
-                            onPanStart: _onPanStart,
-                            onPanUpdate: _onPanUpdate,
-                            onPanEnd: _onPanEnd,
-                            onDoubleTapDown: (d) => _onDoubleTapDown(d, childSize),
-                            onDoubleTap: () {}, // handled in onDoubleTapDown
-                            child: Stack(
-                              children: [
-                                Positioned.fill(
-                                  child: Image.file(widget.imageFile, fit: BoxFit.fill),
-                                ),
-                                Positioned.fill(
+              child: Stack(
+                children: [
+                  InteractiveViewer(
+                    transformationController: _xfm,
+                    minScale: 1.0,
+                    maxScale: 10.0,
+                    panEnabled: true,      // pan with 2 fingers (we'll absorb single-finger drags when >1 pointers)
+                    scaleEnabled: true,    // pinch zoom
+                    boundaryMargin: const EdgeInsets.all(200),
+                    clipBehavior: Clip.none,
+                    child: SizedBox(
+                      width: imgW,
+                      height: imgH,
+                      // Count pointers so we can disable handle-drag when pinching
+                      child: Listener(
+                        onPointerDown: (_) => setState(() => _activePointers++),
+                        onPointerUp:   (_) => setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
+                        onPointerCancel: (_) => setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
+                        child: GestureDetector(
+                          // Double-tap zoom
+                          onDoubleTapDown: _onDoubleTapDown,
+                          onDoubleTap: () {},
+                          behavior: HitTestBehavior.opaque,
+                          child: Stack(
+                            children: [
+                              Positioned.fill(
+                                child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                              ),
+                              // When 2+ fingers are on screen, let InteractiveViewer own gestures.
+                              AbsorbPointer(
+                                absorbing: _activePointers >= 2,
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.translucent,
+                                  onTapDown: _onTapDown,
+                                  onPanStart: _onPanStart,
+                                  onPanUpdate: _onPanUpdate,
+                                  onPanEnd: _onPanEnd,
                                   child: CustomPaint(
                                     painter: _OverlayPainter(
                                       calibA: _calibA, calibB: _calibB,
@@ -343,28 +345,24 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen> with TickerProv
                                     ),
                                   ),
                                 ),
-                              ],
-                            ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
-                      // Zoom controls (floating, non-intrusive)
-                      Positioned(
-                        right: 12,
-                        bottom: 12,
-                        child: Column(
-                          children: [
-                            _ZoomFab(
-                              icon: Icons.zoom_out_map,
-                              tooltip: 'Reset zoom',
-                              onTap: _resetZoom,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  );
-                },
+                    ),
+                  ),
+                  // Zoom reset button
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: _ZoomFab(
+                      icon: Icons.zoom_out_map,
+                      tooltip: 'Reset zoom',
+                      onTap: _resetZoom,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),

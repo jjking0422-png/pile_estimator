@@ -40,7 +40,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   static const double _haloRadius = 10;
   static const double _stroke = 4;
   static const double _midTickR = 3;
-  static const double _hitRadius = 36; // large hit area for tiny dots
+  static const double _hitRadius = 36; // screen-space comfort
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -51,9 +51,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Animation<Matrix4>? _zoomAnim;
 
   // Scale session state
-  Matrix4? _startMatrix;       // matrix at scale start
-  double _startScale = 1.0;    // scale at start
-  Offset _startSceneFocal = Offset.zero; // scene point under the fingers at start
+  Matrix4? _startMatrix;            // matrix at scale start
+  double _startScale = 1.0;         // scale at start
+  Offset _startSceneFocal = Offset.zero; // scene point under fingers at start
+  bool _scalingActive = false;      // true while two-finger scale in progress
+
+  static const double _minScale = 1.0;
+  static const double _maxScale = 10.0;
 
   double get _scale => _xfm.value.getMaxScaleOnAxis();
   bool get _isZoomed => _scale > 1.01;
@@ -103,8 +107,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   // ---------- Gesture logic ----------
   _Handle _hitTestScene(Offset sceneP) {
     double d(Offset? a) => a == null ? 1e9 : (sceneP - a).distance;
-    // Hit radius also scales with zoom so the screen-space hit stays comfy.
-    final hit = _hitRadius / _scale.clamp(1.0, 100.0);
+    final hit = _hitRadius / _scale.clamp(1.0, 100.0); // scale-invariant hit
 
     final entries = <_Handle, double>{
       _Handle.calibA: d(_calibA),
@@ -130,8 +133,9 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     return best;
   }
 
-  // SINGLE-FINGER: tap to place / drag to move
+  // SINGLE-FINGER: tap to place / drag to move (ignored while pinching)
   void _onPanStart(DragStartDetails d) {
+    if (_scalingActive) return;
     final sceneP = _toScene(d.localPosition);
     final grabbed = _hitTestScene(sceneP);
     if (grabbed != _Handle.none) {
@@ -158,7 +162,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _onPanUpdate(DragUpdateDetails d) {
-    if (_dragging == _Handle.none) return;
+    if (_scalingActive || _dragging == _Handle.none) return;
     final sceneP = _toScene(d.localPosition);
     setState(() {
       switch (_dragging) {
@@ -172,10 +176,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _onPanEnd(DragEndDetails d) {
+    if (_scalingActive) return;
     setState(() => _dragging = _Handle.none);
   }
 
   void _onTapDown(TapDownDetails d) {
+    if (_scalingActive) return;
     final sceneP = _toScene(d.localPosition);
     final grabbed = _hitTestScene(sceneP);
     if (grabbed != _Handle.none) {
@@ -205,24 +211,21 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   // TWO-FINGER: custom pinch + pan (no InteractiveViewer)
-  static const double _minScale = 1.0;
-  static const double _maxScale = 10.0;
-
   void _onScaleStart(ScaleStartDetails d) {
-    if (d.pointerCount < 2) return; // ignore single finger here
+    if (d.pointerCount < 2) return;
+    _scalingActive = true;
     _startMatrix = _xfm.value.clone();
     _startScale = _startMatrix!.getMaxScaleOnAxis();
     _startSceneFocal = _toScene(d.localFocalPoint, _startMatrix);
   }
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
-    if (d.pointerCount < 2 || _startMatrix == null) return;
+    if (!_scalingActive || _startMatrix == null || d.pointerCount < 2) return;
 
     final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
     final focalV = d.localFocalPoint;
     final sceneFocal = _startSceneFocal;
 
-    // New matrix that keeps the scene focal point under the fingers
     final next = Matrix4.identity()
       ..translate(focalV.dx, focalV.dy)
       ..scale(desiredScale)
@@ -237,6 +240,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _onScaleEnd(ScaleEndDetails d) {
+    _scalingActive = false;
     _startMatrix = null;
   }
 
@@ -256,10 +260,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     final currentScale = _scale;
     final targetScale = currentScale < 2.0 ? 2.5 : 1.0;
     final f = d.localPosition;
+    final sceneAtTap = _toScene(f);
     final m = Matrix4.identity()
       ..translate(f.dx, f.dy)
       ..scale(targetScale)
-      ..translate(-_toScene(f).dx, -_toScene(f).dy);
+      ..translate(-sceneAtTap.dx, -sceneAtTap.dy);
     _animateTo(m);
   }
 
@@ -334,7 +339,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                 child: Stack(
                   clipBehavior: Clip.hardEdge,
                   children: [
-                    // Transform the image with our matrix
+                    // Transformed image
                     AnimatedBuilder(
                       animation: _xfm,
                       builder: (_, __) => Transform(
@@ -347,44 +352,42 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                       ),
                     ),
 
-                    // Gesture layer (handles both single and two-finger)
+                    // Gesture + overlay (scene is drawn under same transform)
                     Positioned.fill(
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        // Single-finger:
+
+                        // Single-finger edit
                         onTapDown: _onTapDown,
-                        onPanStart: (d) { if (d.kind == PointerDeviceKind.touch) _onPanStart(d); },
+                        onPanStart: _onPanStart,
                         onPanUpdate: _onPanUpdate,
                         onPanEnd: _onPanEnd,
 
-                        // Two-finger pinch+pan:
+                        // Two-finger pinch+pan (custom)
                         onScaleStart: _onScaleStart,
                         onScaleUpdate: _onScaleUpdate,
                         onScaleEnd: _onScaleEnd,
 
-                        // Double-tap zoom:
+                        // Double-tap zoom
                         onDoubleTapDown: _onDoubleTapDown,
                         onDoubleTap: () {},
 
                         child: AnimatedBuilder(
                           animation: _xfm,
-                          builder: (_, __) {
-                            // We draw points/lines in SCENE space, then transform them
-                            return Transform(
-                              transform: _xfm.value,
-                              child: CustomPaint(
-                                size: Size(imgW, imgH),
-                                painter: _OverlayPainter(
-                                  calibA: _calibA, calibB: _calibB,
-                                  measA: _measA,   measB: _measB,
-                                  dotRadius: _dotRadius,
-                                  haloRadius: _haloRadius,
-                                  stroke: _stroke,
-                                  midTickR: _midTickR,
-                                ),
+                          builder: (_, __) => Transform(
+                            transform: _xfm.value,
+                            child: CustomPaint(
+                              size: Size(imgW, imgH),
+                              painter: _OverlayPainter(
+                                calibA: _calibA, calibB: _calibB,
+                                measA: _measA,   measB: _measB,
+                                dotRadius: _dotRadius,
+                                haloRadius: _haloRadius,
+                                stroke: _stroke,
+                                midTickR: _midTickR,
                               ),
-                            );
-                          },
+                            ),
+                          ),
                         ),
                       ),
                     ),

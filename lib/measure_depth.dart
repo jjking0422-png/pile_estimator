@@ -35,12 +35,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Size? _imageSize;
 
   // ===== Visual tuning (smaller) =====
-  static const double _dotRadius = 8;   // was 16
-  static const double _haloRadius = 10; // was 20
-  static const double _stroke = 4;      // was 8
-  static const double _midTickR = 3;    // was 6
-  // Generous hit area so tapping a handle is easy even with small dots
-  static const double _hitRadius = 36;
+  static const double _dotRadius = 8;   // smaller markers
+  static const double _haloRadius = 10;
+  static const double _stroke = 4;
+  static const double _midTickR = 3;
+  static const double _hitRadius = 36;  // big hitbox for tiny dots
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -50,7 +49,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Animation<Matrix4>? _zoomAnim;
   AnimationController? _animCtrl;
 
-  int _activePointers = 0; // for absorbing child gestures while pinching
+  // Track fingers on the OVERLAY so we can let the viewer own multi-touch
+  int _overlayPointers = 0;
   bool get _isZoomed => _xfm.value.getMaxScaleOnAxis() > 1.01;
 
   @override
@@ -115,7 +115,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _onPanStart(DragStartDetails d) {
-    if (_activePointers >= 2) return; // while pinching, let the viewer win
+    if (_overlayPointers >= 2) return; // overlay yields when 2+ fingers
     final p = d.localPosition;
 
     final grabbed = _hitTest(p);
@@ -144,7 +144,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _onPanUpdate(DragUpdateDetails d) {
-    if (_activePointers >= 2 || _dragging == _Handle.none) return;
+    if (_overlayPointers >= 2 || _dragging == _Handle.none) return;
     final p = d.localPosition;
     setState(() {
       switch (_dragging) {
@@ -158,13 +158,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   void _onPanEnd(DragEndDetails d) {
-    if (_activePointers >= 2) return;
+    if (_overlayPointers >= 2) return;
     setState(() => _dragging = _Handle.none);
   }
 
   // Tap: if on a handle, arm it for drag; otherwise place or move nearest
   void _onTapDown(TapDownDetails d) {
-    if (_activePointers >= 2) return;
+    if (_overlayPointers >= 2) return;
     final p = d.localPosition;
 
     final grabbed = _hitTest(p);
@@ -295,56 +295,61 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         children: [
           Expanded(
             child: Center(
-              child: InteractiveViewer(
-                transformationController: _xfm,
-                minScale: 1.0,
-                maxScale: 10.0,
-                scaleEnabled: true,            // pinch zoom always allowed
-                panEnabled: _isZoomed,         // only pan when zoomed (prevents drift at 1x)
-                boundaryMargin: EdgeInsets.zero,
-                clipBehavior: Clip.hardEdge,
-                child: SizedBox(
-                  width: imgW,
-                  height: imgH,
-                  child: Listener(
-                    onPointerDown: (_) => setState(() => _activePointers++),
-                    onPointerUp: (_)   => setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
-                    onPointerCancel: (_) => setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
-                    child: GestureDetector(
-                      onDoubleTapDown: _onDoubleTapDown,
-                      onDoubleTap: () {},
-                      behavior: HitTestBehavior.opaque,
-                      child: Stack(
-                        children: [
-                          Positioned.fill(child: Image.file(widget.imageFile, fit: BoxFit.fill)),
-                          // While pinching (2+ fingers), let the viewer own gestures completely.
-                          Positioned.fill(
-                            child: AbsorbPointer(
-                              absorbing: _activePointers >= 2,
-                              child: GestureDetector(
-                                behavior: HitTestBehavior.translucent,
-                                onTapDown: _onTapDown,
-                                onPanStart: _onPanStart,
-                                onPanUpdate: _onPanUpdate,
-                                onPanEnd: _onPanEnd,
-                                child: CustomPaint(
-                                  painter: _OverlayPainter(
-                                    calibA: _calibA, calibB: _calibB,
-                                    measA: _measA,   measB: _measB,
-                                    dotRadius: _dotRadius,
-                                    haloRadius: _haloRadius,
-                                    stroke: _stroke,
-                                    midTickR: _midTickR,
-                                  ),
-                                ),
-                              ),
+              // Stack: bottom = InteractiveViewer (pinch/pan), top = overlay (single-finger)
+              child: Stack(
+                children: [
+                  // Bottom: viewer always listening for scale;
+                  // pan only when zoomed to avoid drifting at 1x.
+                  InteractiveViewer(
+                    transformationController: _xfm,
+                    minScale: 1.0,
+                    maxScale: 10.0,
+                    scaleEnabled: true,
+                    panEnabled: _isZoomed,
+                    boundaryMargin: EdgeInsets.zero,
+                    clipBehavior: Clip.hardEdge,
+                    child: SizedBox(
+                      width: imgW,
+                      height: imgH,
+                      child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                    ),
+                  ),
+
+                  // Top: overlay that handles single-finger work.
+                  // It *ignores* events as soon as 2+ fingers touch,
+                  // so the InteractiveViewer underneath wins pinch/drag.
+                  Positioned.fill(
+                    child: Listener(
+                      onPointerDown: (_) => setState(() => _overlayPointers++),
+                      onPointerUp: (_) => setState(() =>
+                          _overlayPointers = (_overlayPointers - 1).clamp(0, 10)),
+                      onPointerCancel: (_) => setState(() =>
+                          _overlayPointers = (_overlayPointers - 1).clamp(0, 10)),
+                      child: AbsorbPointer(
+                        absorbing: _overlayPointers >= 2, // yield to viewer while pinching
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onDoubleTapDown: _onDoubleTapDown,
+                          onDoubleTap: () {},
+                          onTapDown: _onTapDown,
+                          onPanStart: _onPanStart,
+                          onPanUpdate: _onPanUpdate,
+                          onPanEnd: _onPanEnd,
+                          child: CustomPaint(
+                            painter: _OverlayPainter(
+                              calibA: _calibA, calibB: _calibB,
+                              measA: _measA,   measB: _measB,
+                              dotRadius: _dotRadius,
+                              haloRadius: _haloRadius,
+                              stroke: _stroke,
+                              midTickR: _midTickR,
                             ),
                           ),
-                        ],
+                        ),
                       ),
                     ),
                   ),
-                ),
+                ],
               ),
             ),
           ),

@@ -34,12 +34,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   // Intrinsic image size
   Size? _imageSize;
 
-  // ===== Visual tuning (smaller) =====
-  static const double _dotRadius = 8;   // smaller markers
-  static const double _haloRadius = 10;
-  static const double _stroke = 4;
-  static const double _midTickR = 3;
-  static const double _hitRadius = 36;  // big hitbox for tiny dots
+  // ===== Visual tuning (half of the “too big” size) =====
+  static const double _dotRadius = 8;    // smaller marker
+  static const double _haloRadius = 10;  // smaller halo
+  static const double _stroke = 4;       // thinner line
+  static const double _midTickR = 3;     // smaller mid tick
+  static const double _hitRadius = 36;   // generous hitbox for easy grabs
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
@@ -49,8 +49,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Animation<Matrix4>? _zoomAnim;
   AnimationController? _animCtrl;
 
-  // Track fingers on the OVERLAY so we can let the viewer own multi-touch
-  int _overlayPointers = 0;
+  // overlay scale state: when true we ignore overlay input so the viewer wins
+  bool _overlayYieldingToPinch = false;
   bool get _isZoomed => _xfm.value.getMaxScaleOnAxis() > 1.01;
 
   @override
@@ -100,10 +100,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     _Handle best = _Handle.none;
     double bestD = _hitRadius;
     map.forEach((h, dist) {
-      if (dist < bestD) {
-        best = h;
-        bestD = dist;
-      }
+      if (dist < bestD) { best = h; bestD = dist; }
     });
 
     // Only handles from the current mode are draggable
@@ -114,10 +111,17 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     return best;
   }
 
-  void _onPanStart(DragStartDetails d) {
-    if (_overlayPointers >= 2) return; // overlay yields when 2+ fingers
-    final p = d.localPosition;
+  // We now drive both tap and drag from a single Scale recognizer:
+  // - pointerCount == 1  => treat as tap/drag for points
+  // - pointerCount >= 2  => immediately yield overlay so InteractiveViewer gets pinch/drag
+  void _onScaleStart(ScaleStartDetails d) {
+    if (d.pointerCount >= 2) {
+      setState(() => _overlayYieldingToPinch = true);
+      return;
+    }
+    final p = d.localFocalPoint;
 
+    // Try to grab a nearby handle first
     final grabbed = _hitTest(p);
     if (grabbed != _Handle.none) {
       HapticFeedback.selectionClick();
@@ -125,7 +129,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       return;
     }
 
-    // Start new segment in the active mode
+    // Otherwise start laying out a new segment in the active mode
     setState(() {
       if (_mode == MeasureMode.calibrate) {
         if (_calibA == null || (_calibA != null && _calibB != null)) {
@@ -143,9 +147,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     });
   }
 
-  void _onPanUpdate(DragUpdateDetails d) {
-    if (_overlayPointers >= 2 || _dragging == _Handle.none) return;
-    final p = d.localPosition;
+  void _onScaleUpdate(ScaleUpdateDetails d) {
+    if (_overlayYieldingToPinch) return; // viewer owns it
+    if (_dragging == _Handle.none) return;
+    final p = d.localFocalPoint;
     setState(() {
       switch (_dragging) {
         case _Handle.calibA: _calibA = p; break;
@@ -157,50 +162,40 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     });
   }
 
-  void _onPanEnd(DragEndDetails d) {
-    if (_overlayPointers >= 2) return;
+  void _onScaleEnd(ScaleEndDetails d) {
+    if (_overlayYieldingToPinch) {
+      // release to InteractiveViewer and re-accept singles afterwards
+      setState(() => _overlayYieldingToPinch = false);
+      return;
+    }
     setState(() => _dragging = _Handle.none);
   }
 
-  // Tap: if on a handle, arm it for drag; otherwise place or move nearest
+  // Single tap to place/move nearest; if tap lands on a handle, arm it for drag
   void _onTapDown(TapDownDetails d) {
-    if (_overlayPointers >= 2) return;
+    if (_overlayYieldingToPinch) return;
     final p = d.localPosition;
 
     final grabbed = _hitTest(p);
     if (grabbed != _Handle.none) {
-      setState(() => _dragging = grabbed); // arm it; user can drag right away
+      setState(() => _dragging = grabbed);
       return;
     }
 
     setState(() {
       if (_mode == MeasureMode.calibrate) {
-        if (_calibA == null) {
-          _calibA = p;
-        } else if (_calibB == null) {
-          _calibB = p;
-        } else {
-          final dA = (_calibA! - p).distance;
-          final dB = (_calibB! - p).distance;
-          if (dA <= dB) {
-            _calibA = p;
-          } else {
-            _calibB = p;
-          }
+        if (_calibA == null) _calibA = p;
+        else if (_calibB == null) _calibB = p;
+        else {
+          final dA = (_calibA! - p).distance, dB = (_calibB! - p).distance;
+          if (dA <= dB) { _calibA = p; } else { _calibB = p; }
         }
       } else {
-        if (_measA == null) {
-          _measA = p;
-        } else if (_measB == null) {
-          _measB = p;
-        } else {
-          final dA = (_measA! - p).distance;
-          final dB = (_measB! - p).distance;
-          if (dA <= dB) {
-            _measA = p;
-          } else {
-            _measB = p;
-          }
+        if (_measA == null) _measA = p;
+        else if (_measB == null) _measB = p;
+        else {
+          final dA = (_measA! - p).distance, dB = (_measB! - p).distance;
+          if (dA <= dB) { _measA = p; } else { _measB = p; }
         }
       }
     });
@@ -295,17 +290,15 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         children: [
           Expanded(
             child: Center(
-              // Stack: bottom = InteractiveViewer (pinch/pan), top = overlay (single-finger)
+              // Bottom: InteractiveViewer (pinch/pan); Top: overlay using Scale gestures for singles.
               child: Stack(
                 children: [
-                  // Bottom: viewer always listening for scale;
-                  // pan only when zoomed to avoid drifting at 1x.
                   InteractiveViewer(
                     transformationController: _xfm,
                     minScale: 1.0,
                     maxScale: 10.0,
-                    scaleEnabled: true,
-                    panEnabled: _isZoomed,
+                    scaleEnabled: true,        // always listen for pinch
+                    panEnabled: _isZoomed,      // no drift at 1x
                     boundaryMargin: EdgeInsets.zero,
                     clipBehavior: Clip.hardEdge,
                     child: SizedBox(
@@ -315,35 +308,29 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                     ),
                   ),
 
-                  // Top: overlay that handles single-finger work.
-                  // It *ignores* events as soon as 2+ fingers touch,
-                  // so the InteractiveViewer underneath wins pinch/drag.
+                  // Overlay for single-finger work; yields on multi-touch.
                   Positioned.fill(
-                    child: Listener(
-                      onPointerDown: (_) => setState(() => _overlayPointers++),
-                      onPointerUp: (_) => setState(() =>
-                          _overlayPointers = (_overlayPointers - 1).clamp(0, 10)),
-                      onPointerCancel: (_) => setState(() =>
-                          _overlayPointers = (_overlayPointers - 1).clamp(0, 10)),
-                      child: AbsorbPointer(
-                        absorbing: _overlayPointers >= 2, // yield to viewer while pinching
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.translucent,
-                          onDoubleTapDown: _onDoubleTapDown,
-                          onDoubleTap: () {},
-                          onTapDown: _onTapDown,
-                          onPanStart: _onPanStart,
-                          onPanUpdate: _onPanUpdate,
-                          onPanEnd: _onPanEnd,
-                          child: CustomPaint(
-                            painter: _OverlayPainter(
-                              calibA: _calibA, calibB: _calibB,
-                              measA: _measA,   measB: _measB,
-                              dotRadius: _dotRadius,
-                              haloRadius: _haloRadius,
-                              stroke: _stroke,
-                              midTickR: _midTickR,
-                            ),
+                    child: IgnorePointer(
+                      ignoring: _overlayYieldingToPinch,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.translucent,
+                        onDoubleTapDown: _onDoubleTapDown,
+                        onDoubleTap: () {},
+
+                        // unified single-finger handler:
+                        onScaleStart: _onScaleStart,
+                        onScaleUpdate: _onScaleUpdate,
+                        onScaleEnd: _onScaleEnd,
+
+                        onTapDown: _onTapDown,
+                        child: CustomPaint(
+                          painter: _OverlayPainter(
+                            calibA: _calibA, calibB: _calibB,
+                            measA: _measA,   measB: _measB,
+                            dotRadius: _dotRadius,
+                            haloRadius: _haloRadius,
+                            stroke: _stroke,
+                            midTickR: _midTickR,
                           ),
                         ),
                       ),

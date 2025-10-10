@@ -19,7 +19,7 @@ enum UnitSystem { feet, meters }
 
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
-  // --- Unit + known length input ---
+  // Unit + known length input (manual entry)
   UnitSystem _unit = UnitSystem.feet;
   final TextEditingController _knownLengthCtrl =
       TextEditingController(text: '4.0');
@@ -28,17 +28,16 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   // Scene-space points
   Offset? _calibA, _calibB, _measA, _measB;
-
   _Handle _dragging = _Handle.none;
 
-  // Calibration
-  double? _pxPerUnit;       // pixels per selected unit (ft or m)
-  double? _measuredValue;   // measured length in current unit
+  // Calibration (pixels per selected unit)
+  double? _pxPerUnit;
+  double? _measuredValue;
 
   // Image size
   Size? _imageSize;
 
-  // Visuals (smaller)
+  // Visuals (compact)
   static const double _dotRadius = 8;
   static const double _haloRadius = 10;
   static const double _stroke = 4;
@@ -58,7 +57,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   double _startScale = 1.0;
   Offset _startSceneFocal = Offset.zero;
 
-  // Single finger helpers
+  // Single-finger helpers
   Offset _singleStartViewport = Offset.zero;
   Offset _singleStartScene = Offset.zero;
   bool _singleMoved = false;
@@ -68,9 +67,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   static const double _tapSlop = 8.0;
 
   double get _scale => _xfm.value.getMaxScaleOnAxis();
-
-  String get _unitLabelShort => _unit == UnitSystem.feet ? 'ft' : 'm';
-  String get _unitLabelLong => _unit == UnitSystem.feet ? 'Feet' : 'Meters';
+  String get _unitShort => _unit == UnitSystem.feet ? 'ft' : 'm';
+  String get _unitLong => _unit == UnitSystem.feet ? 'Feet' : 'Meters';
 
   @override
   void initState() {
@@ -104,7 +102,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     stream.addListener(listener);
   }
 
-  // -------- Math helpers
+  // --- Math helpers
   Offset _toScene(Offset viewportPoint, [Matrix4? matrix]) {
     final m = (matrix ?? _xfm.value).clone()..invert();
     final v = m.transform3(Vector3(viewportPoint.dx, viewportPoint.dy, 0));
@@ -114,21 +112,23 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Matrix4 _clampMatrix(Matrix4 m, Size viewport, Size image) {
     final scale = m.getMaxScaleOnAxis().clamp(_minScale, _maxScale);
     final tx = m.storage[12], ty = m.storage[13];
-    final scaledW = image.width * scale;
-    final scaledH = image.height * scale;
+    final scaledW = image.width * scale, scaledH = image.height * scale;
 
     double minTx, maxTx, minTy, maxTy;
-    if (scaledW <= viewport.width) { final cx = (viewport.width - scaledW) / 2.0; minTx = maxTx = cx; }
-    else { maxTx = 0.0; minTx = viewport.width - scaledW; }
-    if (scaledH <= viewport.height) { final cy = (viewport.height - scaledH) / 2.0; minTy = maxTy = cy; }
-    else { maxTy = 0.0; minTy = viewport.height - scaledH; }
+    if (scaledW <= viewport.width) {
+      final cx = (viewport.width - scaledW) / 2.0; minTx = maxTx = cx;
+    } else { maxTx = 0.0; minTx = viewport.width - scaledW; }
+
+    if (scaledH <= viewport.height) {
+      final cy = (viewport.height - scaledH) / 2.0; minTy = maxTy = cy;
+    } else { maxTy = 0.0; minTy = viewport.height - scaledH; }
 
     return Matrix4.identity()
       ..translate(tx.clamp(minTx, maxTx), ty.clamp(minTy, maxTy))
       ..scale(scale);
   }
 
-  // -------- Hit-testing (scene space)
+  // --- Hit-testing (scene space)
   _Handle _hitTestScene(Offset sceneP) {
     double d(Offset? a) => a == null ? 1e9 : (sceneP - a).distance;
     final hitScene = _hitRadiusScreen / _scale.clamp(1.0, 100.0);
@@ -154,7 +154,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     return best;
   }
 
-  // -------- Unified gesture (scale) for ALL input
+  // --- Unified gestures
   void _onScaleStart(ScaleStartDetails d) {
     if (_imageSize == null) return;
 
@@ -319,25 +319,25 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     _animateTo(m);
   }
 
-  // -------- Calc / flow
+  // --- Calc / flow
   double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
     if (!_calibrationReady) { _snack('Place two blue calibration points.'); return; }
 
     final known = double.tryParse(_knownLengthCtrl.text);
-    if (known == null || known <= 0) { _snack('Enter a valid length in $_unitLabelShort.'); return; }
+    if (known == null || known <= 0) { _snack('Enter a valid length in $_unitShort.'); return; }
 
     final px = _dist(_calibA!, _calibB!);
     if (px <= 0) { _snack('Calibration points overlap.'); return; }
 
     setState(() {
-      _pxPerUnit = px / known;       // pixels per feet OR pixels per meter
+      _pxPerUnit = px / known; // px per ft OR px per m
       _mode = MeasureMode.measure;
       _measA = _measB = null;
       _measuredValue = null;
     });
-    _snack('Calibrated: ${_pxPerUnit!.toStringAsFixed(2)} px/$_unitLabelShort. Now measure (green).');
+    _snack('Calibrated: ${_pxPerUnit!.toStringAsFixed(2)} px/$_unitShort. Now measure (green).');
   }
 
   void _compute() {
@@ -347,7 +347,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     final px = _dist(_measA!, _measB!);
     final val = px / _pxPerUnit!;
     setState(() => _measuredValue = val);
-    _snack('Depth = ${val.toStringAsFixed(2)} $_unitLabelShort');
+    _snack('Depth = ${val.toStringAsFixed(2)} $_unitShort');
   }
 
   void _finish() {
@@ -370,7 +370,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _snack(String m) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
-  // -------- UI
+  // --- UI
   @override
   Widget build(BuildContext context) {
     final imgW = _imageSize?.width ?? 400;
@@ -385,6 +385,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       ),
       body: Column(
         children: [
+          // Image + overlay
           Expanded(
             child: Center(
               child: SizedBox(
@@ -393,33 +394,25 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                 child: Stack(
                   clipBehavior: Clip.hardEdge,
                   children: [
-                    // Transformed image
                     AnimatedBuilder(
                       animation: _xfm,
                       builder: (_, __) => Transform(
                         transform: _xfm.value,
                         child: SizedBox(
-                          width: imgW,
-                          height: imgH,
+                          width: imgW, height: imgH,
                           child: Image.file(widget.imageFile, fit: BoxFit.fill),
                         ),
                       ),
                     ),
-
-                    // Gesture + overlay (drawn in scene coords)
+                    // Gesture + overlay (scene space via same transform)
                     Positioned.fill(
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-
-                        // Unified gestures
                         onScaleStart: _onScaleStart,
                         onScaleUpdate: _onScaleUpdate,
                         onScaleEnd: _onScaleEnd,
-
-                        // Double-tap zoom
                         onDoubleTapDown: _onDoubleTapDown,
                         onDoubleTap: () {},
-
                         child: AnimatedBuilder(
                           animation: _xfm,
                           builder: (_, __) => Transform(
@@ -445,59 +438,90 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
             ),
           ),
 
-          // Controls
+          // Controls (space-efficient; responsive Wrap)
           Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              children: [
-                Row(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final isTight = constraints.maxWidth < 420;
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    SegmentedButton<MeasureMode>(
-                      segments: const [
-                        ButtonSegment(value: MeasureMode.calibrate, label: Text('Calibrate')),
-                        ButtonSegment(value: MeasureMode.measure,   label: Text('Measure')),
-                      ],
-                      selected: <MeasureMode>{_mode},
-                      onSelectionChanged: (s) => setState(() => _mode = s.first),
-                    ),
-                    const SizedBox(width: 12),
-                    if (_mode == MeasureMode.calibrate) ...[
-                      // Unit dropdown
-                      DropdownButton<UnitSystem>(
-                        value: _unit,
-                        onChanged: (u) => setState(() => _unit = u!),
-                        items: const [
-                          DropdownMenuItem(value: UnitSystem.feet,   child: Text('Feet')),
-                          DropdownMenuItem(value: UnitSystem.meters, child: Text('Meters')),
-                        ],
+                    // Mode dropdown (replaces segmented control)
+                    _Box(
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<MeasureMode>(
+                          value: _mode,
+                          onChanged: (m) => setState(() => _mode = m!),
+                          items: const [
+                            DropdownMenuItem(
+                              value: MeasureMode.calibrate, child: Text('Calibrate')),
+                            DropdownMenuItem(
+                              value: MeasureMode.measure, child: Text('Measure')),
+                          ],
+                        ),
                       ),
-                      const SizedBox(width: 8),
-                      // Known length input (in selected unit)
-                      Expanded(
+                    ),
+
+                    if (_mode == MeasureMode.calibrate) ...[
+                      _Box(
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<UnitSystem>(
+                            value: _unit,
+                            onChanged: (u) => setState(() => _unit = u!),
+                            items: const [
+                              DropdownMenuItem(value: UnitSystem.feet, child: Text('Feet')),
+                              DropdownMenuItem(value: UnitSystem.meters, child: Text('Meters')),
+                            ],
+                          ),
+                        ),
+                      ),
+
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          minWidth: isTight ? 160 : 220,
+                          maxWidth: isTight ? constraints.maxWidth - 24 : 260,
+                        ),
                         child: TextField(
                           controller: _knownLengthCtrl,
                           keyboardType: const TextInputType.numberWithOptions(decimal: true),
                           decoration: InputDecoration(
-                            labelText: 'Length (${_unitLabelShort})',
+                            labelText: 'Length (${_unitShort})',
                             border: const OutlineInputBorder(),
                             contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                           ),
                         ),
                       ),
-                      const SizedBox(width: 8),
+
                       FilledButton(
                         onPressed: _calibrationReady ? _setCalibration : null,
                         child: const Text('Set calibration'),
                       ),
                     ],
+
+                    FilledButton.icon(
+                      onPressed: _resetZoom,
+                      icon: const Icon(Icons.zoom_out_map),
+                      label: const Text('Reset zoom'),
+                    ),
                   ],
-                ),
-                const SizedBox(height: 10),
+                );
+              },
+            ),
+          ),
+
+          // Readouts
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: Column(
+              children: [
                 Row(
                   children: [
                     Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
                     const SizedBox(width: 8),
-                    Expanded(child: _statTile('Pixels / ${_unitLabelShort}', _pxPerUnit == null ? '--' : _pxPerUnit!.toStringAsFixed(1), Icons.straighten)),
+                    Expanded(child: _statTile('Pixels / ${_unitShort}', _pxPerUnit == null ? '--' : _pxPerUnit!.toStringAsFixed(1), Icons.straighten)),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -505,7 +529,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                   children: [
                     Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
                     const SizedBox(width: 8),
-                    Expanded(child: _statTile('Depth (${_unitLabelShort})', _measuredValue == null ? '--' : _measuredValue!.toStringAsFixed(2), Icons.calculate)),
+                    Expanded(child: _statTile('Depth (${_unitShort})', _measuredValue == null ? '--' : _measuredValue!.toStringAsFixed(2), Icons.calculate)),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -521,12 +545,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                       onPressed: (_measuredValue != null && _measuredValue! > 0) ? _finish : null,
                       icon: const Icon(Icons.check),
                       label: const Text('Use depth'),
-                    ),
-                    const Spacer(),
-                    FilledButton.icon(
-                      onPressed: _resetZoom,
-                      icon: const Icon(Icons.zoom_out_map),
-                      label: const Text('Reset zoom'),
                     ),
                   ],
                 ),
@@ -561,6 +579,25 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
           ),
         ],
       ),
+    );
+  }
+}
+
+class _Box extends StatelessWidget {
+  final Widget child;
+  const _Box({required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      height: 44,
+      alignment: Alignment.centerLeft,
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: child,
     );
   }
 }

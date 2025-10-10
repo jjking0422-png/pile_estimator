@@ -19,7 +19,7 @@ enum UnitSystem { feet, meters }
 
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
-  // Unit + known length input (manual entry)
+  // Unit + known length input
   UnitSystem _unit = UnitSystem.feet;
   final TextEditingController _knownLengthCtrl =
       TextEditingController(text: '4.0');
@@ -30,14 +30,14 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Offset? _calibA, _calibB, _measA, _measB;
   _Handle _dragging = _Handle.none;
 
-  // Calibration (pixels per selected unit)
-  double? _pxPerUnit;
-  double? _measuredValue;
+  // Calibration
+  double? _pxPerUnit;     // pixels per chosen unit (ft or m)
+  double? _measuredValue; // measured length in chosen unit
 
-  // Image size
+  // Image size (intrinsic)
   Size? _imageSize;
 
-  // Visuals (compact)
+  // Visuals
   static const double _dotRadius = 8;
   static const double _haloRadius = 10;
   static const double _stroke = 4;
@@ -67,8 +67,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   static const double _tapSlop = 8.0;
 
   double get _scale => _xfm.value.getMaxScaleOnAxis();
-  String get _unitShort => _unit == UnitSystem.feet ? 'ft' : 'm';
-  String get _unitLong => _unit == UnitSystem.feet ? 'Feet' : 'Meters';
+  String get _unitShort => _unit == UnitSystem.feet ? "ft" : "m";
 
   @override
   void initState() {
@@ -102,7 +101,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     stream.addListener(listener);
   }
 
-  // --- Math helpers
+  // ---------------- Math helpers
   Offset _toScene(Offset viewportPoint, [Matrix4? matrix]) {
     final m = (matrix ?? _xfm.value).clone()..invert();
     final v = m.transform3(Vector3(viewportPoint.dx, viewportPoint.dy, 0));
@@ -128,7 +127,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       ..scale(scale);
   }
 
-  // --- Hit-testing (scene space)
+  // ---------------- Hit testing (scene space)
   _Handle _hitTestScene(Offset sceneP) {
     double d(Offset? a) => a == null ? 1e9 : (sceneP - a).distance;
     final hitScene = _hitRadiusScreen / _scale.clamp(1.0, 100.0);
@@ -154,7 +153,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     return best;
   }
 
-  // --- Unified gestures
+  // ---------------- Unified gestures
   void _onScaleStart(ScaleStartDetails d) {
     if (_imageSize == null) return;
 
@@ -184,9 +183,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _onScaleUpdate(ScaleUpdateDetails d) {
     if (_imageSize == null) return;
     final img = _imageSize!;
-    final vp = Size(img.width, img.height);
+    final vp = Size(img.width, img.height); // our canvas is sized to the image
 
     if (_gMode == _GestureMode.pinchZoom && d.pointerCount >= 2) {
+      // Build next matrix WITHOUT clamping translation mid-gesture
+      // (prevents tiny corrections that looked like point "drift")
       final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
       final focalV = d.localFocalPoint;
       final sceneFocal = _startSceneFocal;
@@ -200,8 +201,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         next.translate(d.focalPointDelta.dx, d.focalPointDelta.dy);
       }
 
-      next = _clampMatrix(next, vp, img);
-      setState(() => _xfm.value = next);
+      setState(() => _xfm.value = next); // no clamp here
       return;
     }
 
@@ -244,8 +244,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   void _onScaleEnd(ScaleEndDetails d) {
     if (_imageSize == null) return;
+    final img = _imageSize!;
+    final vp = Size(img.width, img.height);
 
     if (_gMode == _GestureMode.pinchZoom) {
+      // Clamp ONCE at the end to keep content in-bounds
+      setState(() => _xfm.value = _clampMatrix(_xfm.value, vp, img));
       _gMode = _GestureMode.none;
       _startMatrix = null;
       return;
@@ -319,15 +323,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     _animateTo(m);
   }
 
-  // --- Calc / flow
+  // ---------------- Calc / flow
   double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
     if (!_calibrationReady) { _snack('Place two blue calibration points.'); return; }
-
     final known = double.tryParse(_knownLengthCtrl.text);
     if (known == null || known <= 0) { _snack('Enter a valid length in $_unitShort.'); return; }
-
     final px = _dist(_calibA!, _calibB!);
     if (px <= 0) { _snack('Calibration points overlap.'); return; }
 
@@ -343,7 +345,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _compute() {
     if (_pxPerUnit == null) { _snack('Set calibration first.'); return; }
     if (!_measurementReady) { _snack('Place two green measurement points.'); return; }
-
     final px = _dist(_measA!, _measB!);
     final val = px / _pxPerUnit!;
     setState(() => _measuredValue = val);
@@ -363,6 +364,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       _knownLengthCtrl.text = '4.0';
       _dragging = _Handle.none;
       _unit = UnitSystem.feet;
+      _xfm.value = Matrix4.identity();
     });
     _snack('Reset. Choose unit, enter length, set two blue points.');
   }
@@ -370,7 +372,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _snack(String m) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
-  // --- UI
+  // ---------------- UI
   @override
   Widget build(BuildContext context) {
     final imgW = _imageSize?.width ?? 400;
@@ -385,86 +387,83 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       ),
       body: Column(
         children: [
-          // Image + overlay
+          // IMAGE + OVERLAY (hard clipped so it never paints over controls)
           Expanded(
             child: Center(
-              child: SizedBox(
-                width: imgW,
-                height: imgH,
-                child: Stack(
-                  clipBehavior: Clip.hardEdge,
-                  children: [
-                    AnimatedBuilder(
-                      animation: _xfm,
-                      builder: (_, __) => Transform(
-                        transform: _xfm.value,
-                        child: SizedBox(
-                          width: imgW, height: imgH,
-                          child: Image.file(widget.imageFile, fit: BoxFit.fill),
+              child: ClipRect( // <-- ensures no drawing outside this region
+                child: SizedBox(
+                  width: imgW,
+                  height: imgH,
+                  child: Stack(
+                    clipBehavior: Clip.hardEdge,
+                    children: [
+                      AnimatedBuilder(
+                        animation: _xfm,
+                        builder: (_, __) => Transform(
+                          transform: _xfm.value,
+                          child: SizedBox(
+                            width: imgW, height: imgH,
+                            child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                          ),
                         ),
                       ),
-                    ),
-                    // Gesture + overlay (scene space via same transform)
-                    Positioned.fill(
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onScaleStart: _onScaleStart,
-                        onScaleUpdate: _onScaleUpdate,
-                        onScaleEnd: _onScaleEnd,
-                        onDoubleTapDown: _onDoubleTapDown,
-                        onDoubleTap: () {},
-                        child: AnimatedBuilder(
-                          animation: _xfm,
-                          builder: (_, __) => Transform(
-                            transform: _xfm.value,
-                            child: CustomPaint(
-                              size: Size(imgW, imgH),
-                              painter: _OverlayPainter(
-                                calibA: _calibA, calibB: _calibB,
-                                measA: _measA,   measB: _measB,
-                                dotRadius: _dotRadius,
-                                haloRadius: _haloRadius,
-                                stroke: _stroke,
-                                midTickR: _midTickR,
+                      // Gesture + overlay (scene space via same transform)
+                      Positioned.fill(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onScaleStart: _onScaleStart,
+                          onScaleUpdate: _onScaleUpdate,
+                          onScaleEnd: _onScaleEnd,
+                          onDoubleTapDown: _onDoubleTapDown,
+                          onDoubleTap: () {},
+                          child: AnimatedBuilder(
+                            animation: _xfm,
+                            builder: (_, __) => Transform(
+                              transform: _xfm.value,
+                              child: CustomPaint(
+                                size: Size(imgW, imgH),
+                                painter: _OverlayPainter(
+                                  calibA: _calibA, calibB: _calibB,
+                                  measA: _measA,   measB: _measB,
+                                  dotRadius: _dotRadius,
+                                  haloRadius: _haloRadius,
+                                  stroke: _stroke,
+                                  midTickR: _midTickR,
+                                ),
                               ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
           ),
 
-          // Controls (space-efficient; responsive Wrap)
+          // CONTROLS (responsive)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final isTight = constraints.maxWidth < 420;
                 return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    // Mode dropdown (replaces segmented control)
+                    // Mode dropdown
                     _Box(
                       child: DropdownButtonHideUnderline(
                         child: DropdownButton<MeasureMode>(
                           value: _mode,
                           onChanged: (m) => setState(() => _mode = m!),
                           items: const [
-                            DropdownMenuItem(
-                              value: MeasureMode.calibrate, child: Text('Calibrate')),
-                            DropdownMenuItem(
-                              value: MeasureMode.measure, child: Text('Measure')),
+                            DropdownMenuItem(value: MeasureMode.calibrate, child: Text('Calibrate')),
+                            DropdownMenuItem(value: MeasureMode.measure,   child: Text('Measure')),
                           ],
                         ),
                       ),
                     ),
-
                     if (_mode == MeasureMode.calibrate) ...[
                       _Box(
                         child: DropdownButtonHideUnderline(
@@ -478,7 +477,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                           ),
                         ),
                       ),
-
                       ConstrainedBox(
                         constraints: BoxConstraints(
                           minWidth: isTight ? 160 : 220,
@@ -494,13 +492,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                           ),
                         ),
                       ),
-
                       FilledButton(
                         onPressed: _calibrationReady ? _setCalibration : null,
                         child: const Text('Set calibration'),
                       ),
                     ],
-
                     FilledButton.icon(
                       onPressed: _resetZoom,
                       icon: const Icon(Icons.zoom_out_map),
@@ -512,7 +508,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
             ),
           ),
 
-          // Readouts
+          // READOUTS
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
             child: Column(
@@ -583,6 +579,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 }
 
+// Small bordered box wrapper for dropdowns
 class _Box extends StatelessWidget {
   final Widget child;
   const _Box({required this.child});

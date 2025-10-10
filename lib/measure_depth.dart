@@ -1,724 +1,709 @@
-// lib/measure_depth.dart
-import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector3;
+
+enum MeasureMode { calibrate, measure }
+enum Unit { feet, meters }
 
 class MeasureDepthScreen extends StatefulWidget {
-  final File imageFile;
-  const MeasureDepthScreen({super.key, required this.imageFile});
+  const MeasureDepthScreen({
+    super.key,
+    required this.imageProvider,
+    this.initialMode = MeasureMode.calibrate,
+    this.initialUnit = Unit.feet,
+    this.initialManualLength,
+    this.title = 'Measure Depth',
+  });
+
+  final ImageProvider imageProvider;
+  final MeasureMode initialMode;
+  final Unit initialUnit;
+  final double? initialManualLength;
+  final String title;
 
   @override
   State<MeasureDepthScreen> createState() => _MeasureDepthScreenState();
 }
 
-enum MeasureMode { calibrate, measure }
-enum _Handle { none, calibA, calibB, measA, measB }
-enum _GestureMode { none, singleEdit, pinchZoom }
-enum UnitSystem { feet, meters }
-
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
-  // Unit + manual known length
-  UnitSystem _unit = UnitSystem.feet;
-  final TextEditingController _knownLengthCtrl =
-      TextEditingController(text: '4.0');
+  final TransformationController _controller = TransformationController();
+  late AnimationController _zoomAnimCtrl;
 
+  Size? _imageSize; // in image pixels
+  bool _isScaling = false; // true when pinch/pan gesture is active
+  bool _draggingPoint = false;
+
+  // Points stored in IMAGE PIXEL SPACE (so they stay glued during zoom/pan)
+  Offset? _calibA;
+  Offset? _calibB;
+  Offset? _measA;
+  Offset? _measB;
+
+  // UI state
   MeasureMode _mode = MeasureMode.calibrate;
+  Unit _unit = Unit.feet;
+  final TextEditingController _manualLenCtrl = TextEditingController();
 
-  // Scene-space points
-  Offset? _calibA, _calibB, _measA, _measB;
-  _Handle _dragging = _Handle.none;
+  // Calibration result
+  double? _pixelsPerUnit;
 
-  // Calibration
-  double? _pxPerUnit;     // pixels per ft or per m
-  double? _measuredValue; // measured value in selected unit
-
-  // Image size (intrinsic)
-  Size? _imageSize;
-
-  // Visual tuning
-  static const double _dotRadius = 8;
-  static const double _haloRadius = 10;
-  static const double _stroke = 4;
-  static const double _midTickR = 3;
-  static const double _hitRadiusScreen = 36;
-
-  bool get _calibrationReady => _calibA != null && _calibB != null;
-  bool get _measurementReady => _measA != null && _measB != null;
-
-  // Transform / gesture state
-  final TransformationController _xfm = TransformationController();
-  AnimationController? _animCtrl;
-  Animation<Matrix4>? _zoomAnim;
-
-  _GestureMode _gMode = _GestureMode.none;
-  Matrix4? _startMatrix;
-  double _startScale = 1.0;
-  Offset _startSceneFocal = Offset.zero;
-
-  // Track fingers across a gesture to suppress accidental taps
-  int _gestureMaxPointers = 0;
-
-  // Single-finger placement/drag state
-  Offset _singleStartViewport = Offset.zero;
-  Offset _singleStartScene = Offset.zero;
-  bool _singleMoved = false;
-
-  static const double _minScale = 1.0;
-  static const double _maxScale = 10.0;
-  static const double _tapSlop = 8.0;
-
-  double get _scale => _xfm.value.getMaxScaleOnAxis();
-  String get _unitShort => _unit == UnitSystem.feet ? 'ft' : 'm';
+  // Tap/drag config
+  static const double _hitRadius = 22; // in screen px for hit-testing
+  static const double _pointRadius = 6; // visual radius on screen (polished smaller)
 
   @override
   void initState() {
     super.initState();
+    _mode = widget.initialMode;
+    _unit = widget.initialUnit;
+    if (widget.initialManualLength != null) {
+      _manualLenCtrl.text = widget.initialManualLength!.toString();
+    }
+    _zoomAnimCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 200));
     _resolveImageSize();
   }
 
   @override
   void dispose() {
-    _animCtrl?.dispose();
-    _xfm.dispose();
-    _knownLengthCtrl.dispose();
+    _zoomAnimCtrl.dispose();
+    _manualLenCtrl.dispose();
+    _controller.dispose();
     super.dispose();
   }
 
   void _resolveImageSize() {
-    final provider = FileImage(widget.imageFile);
-    final stream = provider.resolve(const ImageConfiguration());
+    final stream = widget.imageProvider.resolve(const ImageConfiguration());
     ImageStreamListener? listener;
-    listener = ImageStreamListener((info, _) {
-      if (!mounted) return;
-      setState(() {
-        _imageSize = Size(info.image.width.toDouble(), info.image.height.toDouble());
-      });
-      stream.removeListener(listener!);
-    }, onError: (_, __) {
-      if (!mounted) return;
-      setState(() => _imageSize = const Size(400, 300));
+    listener = ImageStreamListener((ImageInfo info, _) {
+      _imageSize = Size(
+        info.image.width.toDouble(),
+        info.image.height.toDouble(),
+      );
+      setState(() {});
       stream.removeListener(listener!);
     });
     stream.addListener(listener);
   }
 
-  // ---------- Math helpers
-  Offset _toScene(Offset viewportPoint, [Matrix4? matrix]) {
-    final m = (matrix ?? _xfm.value).clone()..invert();
-    final v = m.transform3(Vector3(viewportPoint.dx, viewportPoint.dy, 0));
-    return Offset(v.x, v.y);
+  // ---------- Coordinate transforms ----------
+
+  /// Child space == image pixel space because we size the child to _imageSize exactly.
+  /// _controller.value maps child(image) -> viewport(screen). To go screen->image, invert.
+  Offset _screenToImage(Offset screenPos, RenderBox box) {
+    final Matrix4 m = _controller.value.clone();
+    final Matrix4 inv = Matrix4.inverted(m);
+    // Convert screen to local (viewport) first
+    final Offset local = box.globalToLocal(screenPos);
+    final Vector3 v = Vector3(local.dx, local.dy, 0);
+    final Vector3 r = inv.transform3(v);
+    return Offset(r.x, r.y);
   }
 
-  Matrix4 _clampMatrix(Matrix4 m, Size viewport, Size image) {
-    final scale = m.getMaxScaleOnAxis().clamp(_minScale, _maxScale);
-    final tx = m.storage[12], ty = m.storage[13];
-    final scaledW = image.width * scale, scaledH = image.height * scale;
-
-    double minTx, maxTx, minTy, maxTy;
-    if (scaledW <= viewport.width) {
-      final cx = (viewport.width - scaledW) / 2.0; minTx = maxTx = cx;
-    } else { maxTx = 0.0; minTx = viewport.width - scaledW; }
-
-    if (scaledH <= viewport.height) {
-      final cy = (viewport.height - scaledH) / 2.0; minTy = maxTy = cy;
-    } else { maxTy = 0.0; minTy = viewport.height - scaledH; }
-
-    return Matrix4.identity()
-      ..translate(tx.clamp(minTx, maxTx), ty.clamp(minTy, maxTy))
-      ..scale(scale);
+  Offset _imageToScreen(Offset imagePos) {
+    final Vector3 v = Vector3(imagePos.dx, imagePos.dy, 0);
+    final Vector3 r = _controller.value.transform3(v);
+    return Offset(r.x, r.y);
   }
 
-  // ---------- Hit testing (scene space)
-  _Handle _hitTestScene(Offset sceneP) {
-    double d(Offset? a) => a == null ? 1e9 : (sceneP - a).distance;
-    final hitScene = _hitRadiusScreen / _scale.clamp(1.0, 100.0);
+  // ---------- Point helpers ----------
 
-    _Handle best = _Handle.none;
-    double bestD = hitScene;
-
-    void check(_Handle h, Offset? p) {
-      final dist = d(p);
-      if (dist < bestD) { best = h; bestD = dist; }
+  Offset? _nearestPointOnScreen(Offset screenTap) {
+    final candidates = <Offset>[];
+    if (_mode == MeasureMode.calibrate) {
+      if (_calibA != null) candidates.add(_imageToScreen(_calibA!));
+      if (_calibB != null) candidates.add(_imageToScreen(_calibB!));
+    } else {
+      if (_measA != null) candidates.add(_imageToScreen(_measA!));
+      if (_measB != null) candidates.add(_imageToScreen(_measB!));
     }
+    if (candidates.isEmpty) return null;
 
-    check(_Handle.calibA, _calibA);
-    check(_Handle.calibB, _calibB);
-    check(_Handle.measA, _measA);
-    check(_Handle.measB, _measB);
-
-    if (_mode == MeasureMode.calibrate &&
-        (best == _Handle.measA || best == _Handle.measB)) return _Handle.none;
-    if (_mode == MeasureMode.measure &&
-        (best == _Handle.calibA || best == _Handle.calibB)) return _Handle.none;
-
-    return best;
-  }
-
-  // ---------- Unified gestures (solve accidental taps + drift)
-  void _onScaleStart(ScaleStartDetails d) {
-    if (_imageSize == null) return;
-
-    _gestureMaxPointers = d.pointerCount;
-
-    if (d.pointerCount >= 2) {
-      _gMode = _GestureMode.pinchZoom;
-      _startMatrix = _xfm.value.clone();
-      _startScale = _startMatrix!.getMaxScaleOnAxis();
-      _startSceneFocal = _toScene(d.localFocalPoint, _startMatrix);
-      _dragging = _Handle.none;
-      return;
-    }
-
-    _gMode = _GestureMode.singleEdit;
-    _singleStartViewport = d.localFocalPoint;
-    _singleStartScene = _toScene(_singleStartViewport);
-    _singleMoved = false;
-
-    final grabbed = _hitTestScene(_singleStartScene);
-    _dragging = grabbed;
-    if (grabbed != _Handle.none) {
-      HapticFeedback.selectionClick();
-    }
-  }
-
-  void _onScaleUpdate(ScaleUpdateDetails d) {
-    if (_imageSize == null) return;
-
-    // Track the maximum fingers used during this gesture
-    if (d.pointerCount > _gestureMaxPointers) {
-      _gestureMaxPointers = d.pointerCount;
-    }
-
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
-
-    if (_gMode == _GestureMode.singleEdit) {
-      // If a second finger joins, switch to pinch mode and cancel edit (no point placement)
-      if (_gestureMaxPointers >= 2) {
-        _gMode = _GestureMode.pinchZoom;
-        _startMatrix = _xfm.value.clone();
-        _startScale = _startMatrix!.getMaxScaleOnAxis();
-        _startSceneFocal = _toScene(d.localFocalPoint, _startMatrix);
-        _dragging = _Handle.none;
-        return;
+    Offset best = candidates.first;
+    double bestD2 = (best - screenTap).distanceSquared;
+    for (final c in candidates.skip(1)) {
+      final d2 = (c - screenTap).distanceSquared;
+      if (d2 < bestD2) {
+        best = c;
+        bestD2 = d2;
       }
-
-      // Normal single-finger edit/placement
-      final curViewport = d.localFocalPoint;
-      if ((curViewport - _singleStartViewport).distance > _tapSlop) {
-        _singleMoved = true;
-      }
-      final curScene = _toScene(curViewport);
-
-      if (_dragging != _Handle.none) {
-        setState(() {
-          switch (_dragging) {
-            case _Handle.calibA: _calibA = curScene; break;
-            case _Handle.calibB: _calibB = curScene; break;
-            case _Handle.measA:  _measA  = curScene; break;
-            case _Handle.measB:  _measB  = curScene; break;
-            case _Handle.none: break;
-          }
-        });
-      } else if (_singleMoved) {
-        setState(() {
-          if (_mode == MeasureMode.calibrate) {
-            if (_calibA == null || (_calibA != null && _calibB != null)) {
-              _calibA = _singleStartScene; _calibB = curScene; _dragging = _Handle.calibB;
-            } else {
-              _calibB = curScene; _dragging = _Handle.calibB;
-            }
-          } else {
-            if (_measA == null || (_measA != null && _measB != null)) {
-              _measA = _singleStartScene; _measB = curScene; _dragging = _Handle.measB;
-            } else {
-              _measB = curScene; _dragging = _Handle.measB;
-            }
-          }
-        });
-      }
-      return;
     }
+    if (math.sqrt(bestD2) <= _hitRadius) return best;
+    return null;
+  }
 
-    if (_gMode == _GestureMode.pinchZoom) {
-      // Build next transform that keeps the same *scene* point under the fingers.
-      final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
-      final focalV = d.localFocalPoint;
+  /// Returns a reference to the actual image-space point to mutate (by identity).
+  Offset? _getPointByScreen(Offset screenPt) {
+    if (_mode == MeasureMode.calibrate) {
+      if (_calibA != null && (_imageToScreen(_calibA!) - screenPt).distance <= _hitRadius) {
+        return _calibA;
+      }
+      if (_calibB != null && (_imageToScreen(_calibB!) - screenPt).distance <= _hitRadius) {
+        return _calibB;
+      }
+    } else {
+      if (_measA != null && (_imageToScreen(_measA!) - screenPt).distance <= _hitRadius) {
+        return _measA;
+      }
+      if (_measB != null && (_imageToScreen(_measB!) - screenPt).distance <= _hitRadius) {
+        return _measB;
+      }
+    }
+    return null;
+  }
 
-      Matrix4 next = Matrix4.identity()
-        ..translate(focalV.dx, focalV.dy)
-        ..scale(desiredScale)
-        ..translate(-_startSceneFocal.dx, -_startSceneFocal.dy);
-
-      // NOTE: No extra focalPointDelta translation here — that was the
-      // source of subtle drift between image and overlay.
-
-      // Update immediately (no clamp mid-gesture to avoid micro jumps)
-      _xfm.value = next;
-      setState(() {}); // ensure overlay rebuilds same frame
-      return;
+  void _setPointForMode(int index, Offset imgPos) {
+    if (_mode == MeasureMode.calibrate) {
+      if (index == 0) {
+        _calibA = imgPos;
+      } else {
+        _calibB = imgPos;
+      }
+    } else {
+      if (index == 0) {
+        _measA = imgPos;
+      } else {
+        _measB = imgPos;
+      }
     }
   }
 
-  void _onScaleEnd(ScaleEndDetails d) {
-    if (_imageSize == null) return;
+  List<Offset?> _pointsForMode() {
+    return _mode == MeasureMode.calibrate ? [_calibA, _calibB] : [_measA, _measB];
+  }
 
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
+  // ---------- Gesture handling ----------
 
-    if (_gMode == _GestureMode.pinchZoom) {
-      // Clamp once at the end so content stays in-bounds
-      setState(() => _xfm.value = _clampMatrix(_xfm.value, vp, img));
-      _gMode = _GestureMode.none;
-      _startMatrix = null;
-      _gestureMaxPointers = 0;
-      return;
+  void _onDoubleTapDown(TapDownDetails d, RenderBox box) {
+    // Center zoom on the double-tap location
+    final Offset tapLocal = box.globalToLocal(d.globalPosition);
+    final double currentScale = _currentScale();
+    final double targetScale = (currentScale <= 1.01) ? 2.5 : 1.0;
+
+    final Matrix4 begin = _controller.value.clone();
+    final Matrix4 end = _zoomToPoint(begin, tapLocal, targetScale);
+
+    Animation<Matrix4> tween = Matrix4Tween(begin: begin, end: end).animate(_zoomAnimCtrl);
+    _zoomAnimCtrl.removeListener(_applyAnimatedMatrix);
+    _zoomAnimCtrl.addListener(() {
+      _controller.value = tween.value;
+    });
+    _zoomAnimCtrl.forward(from: 0);
+  }
+
+  Matrix4 _zoomToPoint(Matrix4 base, Offset focalOnViewport, double scale) {
+    // Compute current child-space focal point
+    final Matrix4 inv = Matrix4.inverted(base);
+    final Vector3 focalLocal = inv.transform3(Vector3(focalOnViewport.dx, focalOnViewport.dy, 0));
+
+    final Matrix4 m = Matrix4.identity();
+    m.translate(focalOnViewport.dx, focalOnViewport.dy);
+    final double currentScale = _currentScale();
+    final double delta = scale / currentScale;
+    m.scale(delta, delta);
+    m.translate(-focalOnViewport.dx, -focalOnViewport.dy);
+
+    // Apply around the focal point in child-space to keep that point under finger
+    final Vector3 focalAfter = m.transform3(Vector3(focalOnViewport.dx, focalOnViewport.dy, 0));
+    final Offset focalAfterLocal = Offset(focalAfter.x, focalAfter.y);
+    final Vector3 focalLocalAfter = Matrix4.inverted(base.multiplied(m))
+        .transform3(Vector3(focalAfterLocal.dx, focalAfterLocal.dy, 0));
+
+    // Adjust so that the same child pixel stays under the same viewport pixel
+    final Offset childShift = Offset(focalLocal.dx - focalLocalAfter.x, focalLocal.dy - focalLocalAfter.y);
+    final Matrix4 adjust = Matrix4.identity()..translate(childShift.dx, childShift.dy);
+    return base.multiplied(m).multiplied(adjust);
+  }
+
+  double _currentScale() {
+    final m = _controller.value;
+    // sqrt of upper-left 2x2 determinant approximates uniform scale
+    final sx = m.row0[0];
+    final sy = m.row1[1];
+    return (sx + sy) / 2.0;
+  }
+
+  void _applyAnimatedMatrix() {
+    // no-op; listener body set inline to write controller.value
+  }
+
+  // ---------- Actions ----------
+
+  double? _distanceImage(Offset? a, Offset? b) {
+    if (a == null || b == null) return null;
+    return (a - b).distance;
     }
-
-    if (_gMode == _GestureMode.singleEdit) {
-      // If at any time during this gesture we had 2+ fingers, treat it as pinch → no tap
-      if (_gestureMaxPointers >= 2) {
-        _gMode = _GestureMode.none;
-        _dragging = _Handle.none;
-        _gestureMaxPointers = 0;
-        return;
-      }
-
-      if (!_singleMoved) {
-        final sceneP = _singleStartScene;
-        final grabbed = _hitTestScene(sceneP);
-        if (grabbed != _Handle.none) {
-          setState(() => _dragging = grabbed); // will drag on next move
-        } else {
-          setState(() {
-            if (_mode == MeasureMode.calibrate) {
-              if (_calibA == null) _calibA = sceneP;
-              else if (_calibB == null) _calibB = sceneP;
-              else {
-                final dA = (_calibA! - sceneP).distance;
-                final dB = (_calibB! - sceneP).distance;
-                if (dA <= dB) _calibA = sceneP; else _calibB = sceneP;
-              }
-            } else {
-              if (_measA == null) _measA = sceneP;
-              else if (_measB == null) _measB = sceneP;
-              else {
-                final dA = (_measA! - sceneP).distance;
-                final dB = (_measB! - sceneP).distance;
-                if (dA <= dB) _measA = sceneP; else _measB = sceneP;
-              }
-            }
-          });
-        }
-      }
-      _gMode = _GestureMode.none;
-      _dragging = _Handle.none;
-      _gestureMaxPointers = 0;
-      return;
-    }
-  }
-
-  // ----- Double-tap zoom
-  void _animateTo(Matrix4 target) {
-    _animCtrl?.dispose();
-    _animCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 180));
-    _zoomAnim = Matrix4Tween(begin: _xfm.value, end: target).animate(
-      CurvedAnimation(parent: _animCtrl!, curve: Curves.easeOutCubic),
-    )..addListener(() => setState(() => _xfm.value = _zoomAnim!.value));
-    _animCtrl!.forward();
-  }
-
-  void _resetZoom() {
-    if (_imageSize == null) return;
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
-    setState(() => _xfm.value = _clampMatrix(Matrix4.identity(), vp, img));
-  }
-
-  void _onDoubleTapDown(TapDownDetails d) {
-    if (_imageSize == null) return;
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
-
-    final currentScale = _scale;
-    final targetScale = currentScale < 2.0 ? 2.5 : 1.0;
-    final f = d.localPosition;
-    final sceneAtTap = _toScene(f);
-    Matrix4 m = Matrix4.identity()
-      ..translate(f.dx, f.dy)
-      ..scale(targetScale)
-      ..translate(-sceneAtTap.dx, -sceneAtTap.dy);
-    m = _clampMatrix(m, vp, img);
-    _animateTo(m);
-  }
-
-  // ----- Calc / flow
-  double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
-    if (!_calibrationReady) { _snack('Place two blue calibration points.'); return; }
-    final known = double.tryParse(_knownLengthCtrl.text);
-    if (known == null || known <= 0) { _snack('Enter a valid length in $_unitShort.'); return; }
-    final px = _dist(_calibA!, _calibB!);
-    if (px <= 0) { _snack('Calibration points overlap.'); return; }
-
-    setState(() {
-      _pxPerUnit = px / known;
-      _mode = MeasureMode.measure;
-      _measA = _measB = null;
-      _measuredValue = null;
-    });
-    _snack('Calibrated: ${_pxPerUnit!.toStringAsFixed(2)} px/$_unitShort. Now measure (green).');
+    final px = _distanceImage(_calibA, _calibB);
+    final manual = double.tryParse(_manualLenCtrl.text.trim());
+    if (px == null || manual == null || manual <= 0) {
+      _showSnack('Need two calibration points and a valid length.');
+      return;
+    }
+    _pixelsPerUnit = px / manual; // px per selected unit
+    _showSnack('Calibration set: ${_pixelsPerUnit!.toStringAsFixed(2)} px/${_unitLabel(_unit)}');
+    setState(() {});
   }
 
-  void _compute() {
-    if (_pxPerUnit == null) { _snack('Set calibration first.'); return; }
-    if (!_measurementReady) { _snack('Place two green measurement points.'); return; }
-    final px = _dist(_measA!, _measB!);
-    final val = px / _pxPerUnit!;
-    setState(() => _measuredValue = val);
-    _snack('Depth = ${val.toStringAsFixed(2)} $_unitShort');
+  double? _computeDepth() {
+    if (_pixelsPerUnit == null) {
+      _showSnack('Set calibration first.');
+      return null;
+    }
+    final px = _distanceImage(_measA, _measB);
+    if (px == null) {
+      _showSnack('Place two measurement points.');
+      return null;
+    }
+    return px / _pixelsPerUnit!;
   }
 
-  void _finish() {
-    if (_measuredValue == null || _measuredValue! <= 0) { _snack('No depth computed yet.'); return; }
-    Navigator.of(context).pop<double>(_measuredValue!);
+  void _useDepth() {
+    final d = _computeDepth();
+    if (d == null) return;
+    Navigator.of(context).pop(d);
   }
 
-  void _resetAll() {
-    setState(() {
-      _calibA = _calibB = _measA = _measB = null;
-      _pxPerUnit = null; _measuredValue = null;
-      _mode = MeasureMode.calibrate;
-      _knownLengthCtrl.text = '4.0';
-      _dragging = _Handle.none;
-      _unit = UnitSystem.feet;
-      _xfm.value = Matrix4.identity();
-    });
-    _snack('Reset. Choose unit, enter length, set two blue points.');
+  String _unitLabel(Unit u) => u == Unit.feet ? 'ft' : 'm';
+
+  void _showSnack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  void _snack(String m) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  // ---------- Build ----------
 
-  // ---------- UI
   @override
   Widget build(BuildContext context) {
-    final imgW = _imageSize?.width ?? 400;
-    final imgH = _imageSize?.height ?? 300;
-
+    final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Measure Depth'),
-        actions: [
-          IconButton(onPressed: _resetAll, tooltip: 'Reset', icon: const Icon(Icons.refresh)),
-        ],
-      ),
-      body: Column(
-        children: [
-          // IMAGE + OVERLAY (hard clipped so it never paints over controls)
-          Expanded(
-            child: Center(
-              child: ClipRect(
-                child: SizedBox(
-                  width: imgW,
-                  height: imgH,
-                  child: Stack(
-                    clipBehavior: Clip.hardEdge,
-                    children: [
-                      AnimatedBuilder(
-                        animation: _xfm,
-                        builder: (_, __) => Transform(
-                          transform: _xfm.value,
+      appBar: AppBar(title: Text(widget.title)),
+      body: _imageSize == null
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              children: [
+                // Viewer area
+                Expanded(
+                  child: ClipRect( // Prevent overlay from crossing into bottom panel
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        // We render the child at EXACTLY image pixel size, centered.
+                        final viewer = Center(
                           child: SizedBox(
-                            width: imgW, height: imgH,
-                            child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                            width: _imageSize!.width,
+                            height: _imageSize!.height,
+                            child: Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                // Interactive viewer wraps the image+overlay
+                                _buildInteractiveLayer(),
+                                // Overlay painter draws points/lines in screen space
+                                IgnorePointer(ignoring: true, child: _OverlayPainterWidget(
+                                  controller: _controller,
+                                  calibA: _calibA,
+                                  calibB: _calibB,
+                                  measA: _measA,
+                                  measB: _measB,
+                                  pointRadius: _pointRadius,
+                                  activeMode: _mode,
+                                )),
+                              ],
+                            ),
                           ),
-                        ),
-                      ),
-                      // Gesture + overlay (scene space via same transform)
-                      Positioned.fill(
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onScaleStart: _onScaleStart,
-                          onScaleUpdate: _onScaleUpdate,
-                          onScaleEnd: _onScaleEnd,
-                          onDoubleTapDown: _onDoubleTapDown,
-                          onDoubleTap: () {},
-                          child: AnimatedBuilder(
-                            animation: _xfm,
-                            builder: (_, __) => Transform(
-                              transform: _xfm.value,
-                              child: CustomPaint(
-                                size: Size(imgW, imgH),
-                                painter: _OverlayPainter(
-                                  calibA: _calibA, calibB: _calibB,
-                                  measA: _measA,   measB: _measB,
-                                  dotRadius: _dotRadius,
-                                  haloRadius: _haloRadius,
-                                  stroke: _stroke,
-                                  midTickR: _midTickR,
+                        );
+                        return Container(color: Colors.black12, child: viewer);
+                      },
+                    ),
+                  ),
+                ),
+
+                // Control panel
+                SafeArea(
+                  top: false,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          children: [
+                            // Mode
+                            Expanded(
+                              child: _Labeled(
+                                label: 'Mode',
+                                child: DropdownButtonFormField<MeasureMode>(
+                                  value: _mode,
+                                  onChanged: (v) => setState(() => _mode = v!),
+                                  items: const [
+                                    DropdownMenuItem(value: MeasureMode.calibrate, child: Text('Calibrate')),
+                                    DropdownMenuItem(value: MeasureMode.measure, child: Text('Measure')),
+                                  ],
                                 ),
                               ),
                             ),
-                          ),
+                            const SizedBox(width: 12),
+                            // Unit
+                            Expanded(
+                              child: _Labeled(
+                                label: 'Units',
+                                child: DropdownButtonFormField<Unit>(
+                                  value: _unit,
+                                  onChanged: (v) => setState(() => _unit = v!),
+                                  items: const [
+                                    DropdownMenuItem(value: Unit.feet, child: Text('Feet')),
+                                    DropdownMenuItem(value: Unit.meters, child: Text('Meters')),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            // Manual length
+                            Expanded(
+                              child: _Labeled(
+                                label: 'Calibration length',
+                                child: TextFormField(
+                                  controller: _manualLenCtrl,
+                                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                                  decoration: InputDecoration(
+                                    hintText: 'e.g. 4.0',
+                                    suffixText: _unitLabel(_unit),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-
-          // CONTROLS
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
-            child: Wrap(
-              spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                // Mode dropdown
-                _Box(
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<MeasureMode>(
-                      value: _mode,
-                      onChanged: (m) => setState(() => _mode = m!),
-                      items: const [
-                        DropdownMenuItem(value: MeasureMode.calibrate, child: Text('Calibrate')),
-                        DropdownMenuItem(value: MeasureMode.measure,   child: Text('Measure')),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: FilledButton(
+                                onPressed: _setCalibration,
+                                child: const Text('Set calibration'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: OutlinedButton(
+                                onPressed: () {
+                                  final d = _computeDepth();
+                                  if (d != null) {
+                                    _showSnack('Depth: ${d.toStringAsFixed(3)} ${_unitLabel(_unit)}');
+                                  }
+                                },
+                                child: const Text('Compute depth'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: ElevatedButton(
+                                onPressed: _useDepth,
+                                child: const Text('Use depth'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (_pixelsPerUnit != null) ...[
+                          const SizedBox(height: 8),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: Text(
+                              'Calibrated: ${_pixelsPerUnit!.toStringAsFixed(2)} px/${_unitLabel(_unit)}',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
                 ),
-                if (_mode == MeasureMode.calibrate) ...[
-                  _Box(
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<UnitSystem>(
-                        value: _unit,
-                        onChanged: (u) => setState(() => _unit = u!),
-                        items: const [
-                          DropdownMenuItem(value: UnitSystem.feet, child: Text('Feet')),
-                          DropdownMenuItem(value: UnitSystem.meters, child: Text('Meters')),
-                        ],
-                      ),
-                    ),
-                  ),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(minWidth: 180, maxWidth: 260),
-                    child: TextField(
-                      controller: _knownLengthCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      decoration: InputDecoration(
-                        labelText: 'Length (${_unitShort})',
-                        border: const OutlineInputBorder(),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                      ),
-                    ),
-                  ),
-                  FilledButton(
-                    onPressed: _calibrationReady ? _setCalibration : null,
-                    child: const Text('Set calibration'),
-                  ),
-                ],
-                FilledButton.icon(
-                  onPressed: _resetZoom,
-                  icon: const Icon(Icons.zoom_out_map),
-                  label: const Text('Reset zoom'),
-                ),
               ],
             ),
-          ),
-
-          // READOUTS
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
-                    const SizedBox(width: 8),
-                    Expanded(child: _statTile('Pixels / ${_unitShort}', _pxPerUnit == null ? '--' : _pxPerUnit!.toStringAsFixed(1), Icons.straighten)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
-                    const SizedBox(width: 8),
-                    Expanded(child: _statTile('Depth (${_unitShort})', _measuredValue == null ? '--' : _measuredValue!.toStringAsFixed(2), Icons.calculate)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    OutlinedButton.icon(
-                      onPressed: _measurementReady ? _compute : null,
-                      icon: const Icon(Icons.calculate),
-                      label: const Text('Compute depth'),
-                    ),
-                    const SizedBox(width: 8),
-                    FilledButton.icon(
-                      onPressed: (_measuredValue != null && _measuredValue! > 0) ? _finish : null,
-                      icon: const Icon(Icons.check),
-                      label: const Text('Use depth'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
     );
   }
 
-  Widget _statTile(String title, String value, IconData icon) {
-    final theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceVariant,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, size: 20),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: theme.textTheme.labelMedium),
-                Text(value, style: theme.textTheme.titleMedium),
-              ],
+  Widget _buildInteractiveLayer() {
+    return LayoutBuilder(builder: (context, _) {
+      return Listener(
+        onPointerDown: (_) {}, // needed to ensure GestureDetector receives events above InteractiveViewer
+        child: InteractiveViewer(
+          transformationController: _controller,
+          minScale: 1.0,
+          maxScale: 6.0,
+          panEnabled: true,
+          scaleEnabled: true,
+          onInteractionStart: (details) {
+            _isScaling = details.pointerCount > 1;
+            _draggingPoint = false;
+          },
+          onInteractionUpdate: (details) {
+            // If fingers increase beyond one, treat as scaling to suppress placement
+            if (details.pointerCount > 1) _isScaling = true;
+          },
+          onInteractionEnd: (details) {
+            _isScaling = false;
+            _draggingPoint = false;
+          },
+          child: _buildGestureLayer(),
+        ),
+      );
+    });
+  }
+
+  Widget _buildGestureLayer() {
+    return LayoutBuilder(builder: (context, _) {
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onDoubleTapDown: (d) {
+          final box = context.findRenderObject() as RenderBox;
+          _onDoubleTapDown(d, box);
+        },
+        onDoubleTap: () {},
+
+        onPanStart: (details) {
+          if (_isScaling) return; // suppress during pinch/pan
+          final box = context.findRenderObject() as RenderBox;
+          final tap = details.globalPosition;
+          final nearest = _nearestPointOnScreen(tap);
+          if (nearest != null) {
+            // Start dragging an existing point
+            _draggingPoint = true;
+          } else {
+            // Place or replace the first missing point for current mode
+            if (_imageSize == null) return;
+            final img = _screenToImage(tap, box);
+            final clamped = _clampToImage(img);
+            final pts = _pointsForMode();
+            if (pts[0] == null) {
+              _setPointForMode(0, clamped);
+            } else if (pts[1] == null) {
+              _setPointForMode(1, clamped);
+            } else {
+              // Replace the farther one from the tap for convenience
+              final d0 = (_imageToScreen(pts[0]!) - tap).distance;
+              final d1 = (_imageToScreen(pts[1]!) - tap).distance;
+              _setPointForMode(d0 > d1 ? 0 : 1, clamped);
+            }
+            setState(() {});
+          }
+        },
+        onPanUpdate: (details) {
+          if (_isScaling) return;
+          if (!_draggingPoint) {
+            // Start drag if finger moved on a point
+            final box = context.findRenderObject() as RenderBox;
+            final screenNow = details.globalPosition;
+            final hit = _getPointByScreen(screenNow);
+            if (hit != null) _draggingPoint = true;
+          }
+          if (_draggingPoint) {
+            final box = context.findRenderObject() as RenderBox;
+            final img = _screenToImage(details.globalPosition, box);
+            final clamped = _clampToImage(img);
+
+            // Move whichever point is under finger
+            if (_mode == MeasureMode.calibrate) {
+              if (_calibA != null &&
+                  (_imageToScreen(_calibA!) - details.globalPosition).distance <= _hitRadius) {
+                _calibA = clamped;
+              } else if (_calibB != null &&
+                  (_imageToScreen(_calibB!) - details.globalPosition).distance <= _hitRadius) {
+                _calibB = clamped;
+              }
+            } else {
+              if (_measA != null &&
+                  (_imageToScreen(_measA!) - details.globalPosition).distance <= _hitRadius) {
+                _measA = clamped;
+              } else if (_measB != null &&
+                  (_imageToScreen(_measB!) - details.globalPosition).distance <= _hitRadius) {
+                _measB = clamped;
+              }
+            }
+            setState(() {});
+          }
+        },
+        onPanEnd: (_) {
+          _draggingPoint = false;
+        },
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            Image(
+              image: widget.imageProvider,
+              filterQuality: FilterQuality.high,
+              isAntiAlias: true,
+              // No fit: child is sized to image pixels by parent SizedBox
             ),
-          ),
-        ],
-      ),
+            // The CustomPainter overlay is placed in the outer Stack via _OverlayPainterWidget.
+            // We keep this layer to ensure the GestureDetector sits above the image.
+          ],
+        ),
+      );
+    });
+  }
+
+  Offset _clampToImage(Offset p) {
+    return Offset(
+      p.dx.clamp(0.0, _imageSize!.width),
+      p.dy.clamp(0.0, _imageSize!.height),
     );
   }
 }
 
-class _Box extends StatelessWidget {
-  final Widget child;
-  const _Box({required this.child});
+class _OverlayPainterWidget extends StatelessWidget {
+  const _OverlayPainterWidget({
+    required this.controller,
+    required this.calibA,
+    required this.calibB,
+    required this.measA,
+    required this.measB,
+    required this.pointRadius,
+    required this.activeMode,
+  });
+
+  final TransformationController controller;
+  final Offset? calibA;
+  final Offset? calibB;
+  final Offset? measA;
+  final Offset? measB;
+  final double pointRadius;
+  final MeasureMode activeMode;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      height: 44,
-      alignment: Alignment.centerLeft,
-      decoration: BoxDecoration(
-        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-        borderRadius: BorderRadius.circular(10),
+    return CustomPaint(
+      painter: _OverlayPainter(
+        controller: controller,
+        calibA: calibA,
+        calibB: calibB,
+        measA: measA,
+        measB: measB,
+        pointRadius: pointRadius,
+        activeMode: activeMode,
       ),
-      child: child,
     );
   }
 }
 
 class _OverlayPainter extends CustomPainter {
-  final Offset? calibA, calibB, measA, measB;
-  final double dotRadius, haloRadius, stroke, midTickR;
-
   _OverlayPainter({
+    required this.controller,
     required this.calibA,
     required this.calibB,
     required this.measA,
     required this.measB,
-    required this.dotRadius,
-    required this.haloRadius,
-    required this.stroke,
-    required this.midTickR,
+    required this.pointRadius,
+    required this.activeMode,
   });
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    final whiteHalo = Paint()
-      ..color = Colors.white
-      ..style = PaintingStyle.fill
-      ..isAntiAlias = true;
+  final TransformationController controller;
+  final Offset? calibA;
+  final Offset? calibB;
+  final Offset? measA;
+  final Offset? measB;
+  final double pointRadius;
+  final MeasureMode activeMode;
 
-    final blue = Paint()
-      ..color = const Color(0xFF1565C0)
-      ..style = PaintingStyle.fill
-      ..isAntiAlias = true;
-
-    final green = Paint()
-      ..color = const Color(0xFF2E7D32)
-      ..style = PaintingStyle.fill
-      ..isAntiAlias = true;
-
-    final lineHalo = Paint()
-      ..color = Colors.black.withOpacity(0.35)
-      ..strokeWidth = stroke + 3
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke
-      ..isAntiAlias = true;
-
-    final blueLine = Paint()
-      ..color = const Color(0xFF1565C0)
-      ..strokeWidth = stroke
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke
-      ..isAntiAlias = true;
-
-    final greenLine = Paint()
-      ..color = const Color(0xFF2E7D32)
-      ..strokeWidth = stroke
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke
-      ..isAntiAlias = true;
-
-    void point(Offset? p, Paint color) {
-      if (p == null) return;
-      canvas.drawCircle(p, haloRadius, whiteHalo);
-      canvas.drawCircle(p, dotRadius, color);
-    }
-
-    void drawSegment(Offset? a, Offset? b, Paint line) {
-      if (a == null || b == null) return;
-      canvas.drawLine(a, b, lineHalo);
-      canvas.drawLine(a, b, line);
-
-      final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
-      final midFill = Paint()
-        ..color = (line == blueLine) ? const Color(0xFF1565C0) : const Color(0xFF2E7D32)
-        ..style = PaintingStyle.fill
-        ..isAntiAlias = true;
-      final midStroke = Paint()
-        ..color = Colors.white
-        ..strokeWidth = 2
-        ..style = PaintingStyle.stroke
-        ..isAntiAlias = true;
-      canvas.drawCircle(mid, midTickR, midFill);
-      canvas.drawCircle(mid, midTickR, midStroke);
-    }
-
-    // Calibrate (blue)
-    point(calibA, blue);
-    point(calibB, blue);
-    drawSegment(calibA, calibB, blueLine);
-
-    // Measure (green)
-    point(measA, green);
-    point(measB, green);
-    drawSegment(measA, measB, greenLine);
+  Offset _toScreen(Offset? img) {
+    if (img == null) return Offset.zero;
+    final v = Vector3(img.dx, img.dy, 0);
+    final r = controller.value.transform3(v);
+    return Offset(r.x, r.y);
   }
 
   @override
-  bool shouldRepaint(covariant _OverlayPainter old) {
-    return old.calibA != calibA ||
-        old.calibB != calibB ||
-        old.measA != measA ||
-        old.measB != measB ||
-        old.dotRadius != dotRadius ||
-        old.haloRadius != haloRadius ||
-        old.stroke != stroke ||
-        old.midTickR != midTickR;
+  void paint(Canvas canvas, Size size) {
+    final paintLineCal = Paint()
+      ..color = Colors.orangeAccent
+      ..strokeWidth = 2.0;
+
+    final paintLineMea = Paint()
+      ..color = Colors.lightBlueAccent
+      ..strokeWidth = 2.0;
+
+    final paintPointActive = Paint()..color = Colors.redAccent;
+    final paintPointIdle = Paint()..color = Colors.white;
+    final paintPointStroke = Paint()
+      ..color = Colors.black87
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5;
+
+    // Draw calibration
+    final aC = _toScreen(calibA);
+    final bC = _toScreen(calibB);
+    if (calibA != null && calibB != null) {
+      canvas.drawLine(aC, bC, paintLineCal);
+    }
+    if (calibA != null) {
+      _drawPoint(canvas, aC, activeMode == MeasureMode.calibrate ? paintPointActive : paintPointIdle);
+    }
+    if (calibB != null) {
+      _drawPoint(canvas, bC, activeMode == MeasureMode.calibrate ? paintPointActive : paintPointIdle);
+    }
+
+    // Draw measurement
+    final aM = _toScreen(measA);
+    final bM = _toScreen(measB);
+    if (measA != null && measB != null) {
+      canvas.drawLine(aM, bM, paintLineMea);
+    }
+    if (measA != null) {
+      _drawPoint(canvas, aM, activeMode == MeasureMode.measure ? paintPointActive : paintPointIdle);
+    }
+    if (measB != null) {
+      _drawPoint(canvas, bM, activeMode == MeasureMode.measure ? paintPointActive : paintPointIdle);
+    }
+
+    // Point borders
+    if (calibA != null) canvas.drawCircle(aC, pointRadius, paintPointStroke);
+    if (calibB != null) canvas.drawCircle(bC, pointRadius, paintPointStroke);
+    if (measA != null) canvas.drawCircle(aM, pointRadius, paintPointStroke);
+    if (measB != null) canvas.drawCircle(bM, pointRadius, paintPointStroke);
+  }
+
+  void _drawPoint(Canvas canvas, Offset p, Paint fill) {
+    canvas.drawCircle(p, pointRadius, fill);
+  }
+
+  @override
+  bool shouldRepaint(covariant _OverlayPainter oldDelegate) {
+    return oldDelegate.controller.value != controller.value ||
+        oldDelegate.calibA != calibA ||
+        oldDelegate.calibB != calibB ||
+        oldDelegate.measA != measA ||
+        oldDelegate.measB != measB ||
+        oldDelegate.pointRadius != pointRadius ||
+        oldDelegate.activeMode != activeMode;
+  }
+}
+
+class _Labeled extends StatelessWidget {
+  const _Labeled({required this.label, required this.child});
+  final String label;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final s = Theme.of(context).textTheme.labelSmall;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: s),
+        const SizedBox(height: 4),
+        child,
+      ],
+    );
+  }
+}
+
+// -------- Vector3 helper (no external deps) --------
+class Vector3 {
+  double x, y, z;
+  Vector3(this.x, this.y, this.z);
+}
+
+extension _M4 on Matrix4 {
+  Vector3 transform3(Vector3 v) {
+    final r = this.transform(Vector4(v.x, v.y, v.z, 1));
+    return Vector3(r.x, r.y, r.z);
   }
 }

@@ -14,6 +14,7 @@ class MeasureDepthScreen extends StatefulWidget {
 
 enum MeasureMode { calibrate, measure }
 enum _Handle { none, calibA, calibB, measA, measB }
+enum _GestureMode { none, singleEdit, pinchZoom }
 
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
@@ -32,32 +33,38 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   double? _pxPerFt;
   double? _measuredFeet;
 
-  // Intrinsic image size
+  // Image size
   Size? _imageSize;
 
-  // ===== Visual tuning (halved) =====
+  // Visual tuning (smaller)
   static const double _dotRadius = 8;
   static const double _haloRadius = 10;
   static const double _stroke = 4;
   static const double _midTickR = 3;
-  static const double _hitRadius = 36; // screen-space comfort
+  static const double _hitRadiusScreen = 36; // screen-space comfort
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
 
-  // ===== Custom zoom/pan =====
-  final TransformationController _xfm = TransformationController(); // current matrix
+  // Transform
+  final TransformationController _xfm = TransformationController();
   AnimationController? _animCtrl;
   Animation<Matrix4>? _zoomAnim;
 
   // Scale session state
-  Matrix4? _startMatrix;            // matrix at scale start
-  double _startScale = 1.0;         // scale at start
-  Offset _startSceneFocal = Offset.zero; // scene point under fingers at start
-  bool _scalingActive = false;      // true while two-finger scale in progress
+  _GestureMode _gMode = _GestureMode.none;
+  Matrix4? _startMatrix;
+  double _startScale = 1.0;
+  Offset _startSceneFocal = Offset.zero;
+
+  // Single-finger session state
+  Offset _singleStartViewport = Offset.zero;
+  Offset _singleStartScene = Offset.zero;
+  bool _singleMoved = false;
 
   static const double _minScale = 1.0;
   static const double _maxScale = 10.0;
+  static const double _tapSlop = 8.0; // px in viewport space
 
   double get _scale => _xfm.value.getMaxScaleOnAxis();
   bool get _isZoomed => _scale > 1.01;
@@ -83,13 +90,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     listener = ImageStreamListener((info, _) {
       if (!mounted) return;
       setState(() {
-        _imageSize = Size(
-          info.image.width.toDouble(),
-          info.image.height.toDouble(),
-        );
+        _imageSize =
+            Size(info.image.width.toDouble(), info.image.height.toDouble());
       });
       stream.removeListener(listener!);
-    }, onError: (e, st) {
+    }, onError: (_, __) {
       if (!mounted) return;
       setState(() => _imageSize = const Size(400, 300));
       stream.removeListener(listener!);
@@ -97,154 +102,224 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     stream.addListener(listener);
   }
 
-  // ---------- Coordinate helpers ----------
+  // ---------- Math helpers ----------
   Offset _toScene(Offset viewportPoint, [Matrix4? matrix]) {
     final m = (matrix ?? _xfm.value).clone()..invert();
     final v = m.transform3(Vector3(viewportPoint.dx, viewportPoint.dy, 0));
     return Offset(v.x, v.y);
   }
 
-  // ---------- Gesture logic ----------
+  Matrix4 _clampMatrix(Matrix4 m, Size viewport, Size image) {
+    // Decompose scale and translation (we only use uniform scale)
+    final scale = m.getMaxScaleOnAxis().clamp(_minScale, _maxScale);
+    // Extract translation from matrix
+    final tx = m.storage[12];
+    final ty = m.storage[13];
+
+    final scaledW = image.width * scale;
+    final scaledH = image.height * scale;
+
+    double minTx, maxTx, minTy, maxTy;
+
+    if (scaledW <= viewport.width) {
+      // Center horizontally
+      final cx = (viewport.width - scaledW) / 2.0;
+      minTx = maxTx = cx;
+    } else {
+      // Keep image covering viewport horizontally
+      maxTx = 0.0;
+      minTx = viewport.width - scaledW;
+    }
+
+    if (scaledH <= viewport.height) {
+      // Center vertically
+      final cy = (viewport.height - scaledH) / 2.0;
+      minTy = maxTy = cy;
+    } else {
+      maxTy = 0.0;
+      minTy = viewport.height - scaledH;
+    }
+
+    final clampedTx = tx.clamp(minTx, maxTx);
+    final clampedTy = ty.clamp(minTy, maxTy);
+
+    final out = Matrix4.identity()
+      ..translate(clampedTx, clampedTy)
+      ..scale(scale);
+    return out;
+  }
+
+  // ---------- Hit testing in scene space ----------
   _Handle _hitTestScene(Offset sceneP) {
     double d(Offset? a) => a == null ? 1e9 : (sceneP - a).distance;
-    final hit = _hitRadius / _scale.clamp(1.0, 100.0); // scale-invariant hit
-
-    final entries = <_Handle, double>{
-      _Handle.calibA: d(_calibA),
-      _Handle.calibB: d(_calibB),
-      _Handle.measA:  d(_measA),
-      _Handle.measB:  d(_measB),
-    };
+    final hitScene = _hitRadiusScreen / _scale.clamp(1.0, 100.0);
 
     _Handle best = _Handle.none;
-    double bestD = hit;
-    entries.forEach((h, dist) {
-      if (dist < bestD) {
-        bestD = dist;
-        best = h;
-      }
-    });
+    double bestD = hitScene;
 
-    // Only allow dragging handles for the current mode
+    void check(_Handle h, Offset? p) {
+      final dist = d(p);
+      if (dist < bestD) {
+        best = h;
+        bestD = dist;
+      }
+    }
+
+    check(_Handle.calibA, _calibA);
+    check(_Handle.calibB, _calibB);
+    check(_Handle.measA, _measA);
+    check(_Handle.measB, _measB);
+
+    // Only allow handles for the active mode
     if (_mode == MeasureMode.calibrate &&
         (best == _Handle.measA || best == _Handle.measB)) return _Handle.none;
     if (_mode == MeasureMode.measure &&
         (best == _Handle.calibA || best == _Handle.calibB)) return _Handle.none;
+
     return best;
   }
 
-  // SINGLE-FINGER: tap to place / drag to move (ignored while pinching)
-  void _onPanStart(DragStartDetails d) {
-    if (_scalingActive) return;
-    final sceneP = _toScene(d.localPosition);
-    final grabbed = _hitTestScene(sceneP);
+  // ---------- Unified gesture (scale) ----------
+  void _onScaleStart(ScaleStartDetails d) {
+    if (_imageSize == null) return;
+
+    if (d.pointerCount >= 2) {
+      // Begin pinch-zoom
+      _gMode = _GestureMode.pinchZoom;
+      _startMatrix = _xfm.value.clone();
+      _startScale = _startMatrix!.getMaxScaleOnAxis();
+      _startSceneFocal = _toScene(d.localFocalPoint, _startMatrix);
+      _dragging = _Handle.none;
+      return;
+    }
+
+    // Single finger: begin edit path
+    _gMode = _GestureMode.singleEdit;
+    _singleStartViewport = d.localFocalPoint;
+    _singleStartScene = _toScene(_singleStartViewport);
+    _singleMoved = false;
+
+    final grabbed = _hitTestScene(_singleStartScene);
     if (grabbed != _Handle.none) {
       HapticFeedback.selectionClick();
-      setState(() => _dragging = grabbed);
-      return;
+      _dragging = grabbed;
+    } else {
+      // Not on a handle — create/prepare a segment (we'll commit on move/tap)
+      _dragging = _Handle.none;
     }
-
-    setState(() {
-      if (_mode == MeasureMode.calibrate) {
-        if (_calibA == null || (_calibA != null && _calibB != null)) {
-          _calibA = sceneP; _calibB = sceneP; _dragging = _Handle.calibB;
-        } else {
-          _calibB = sceneP; _dragging = _Handle.calibB;
-        }
-      } else {
-        if (_measA == null || (_measA != null && _measB != null)) {
-          _measA = sceneP; _measB = sceneP; _dragging = _Handle.measB;
-        } else {
-          _measB = sceneP; _dragging = _Handle.measB;
-        }
-      }
-    });
-  }
-
-  void _onPanUpdate(DragUpdateDetails d) {
-    if (_scalingActive || _dragging == _Handle.none) return;
-    final sceneP = _toScene(d.localPosition);
-    setState(() {
-      switch (_dragging) {
-        case _Handle.calibA: _calibA = sceneP; break;
-        case _Handle.calibB: _calibB = sceneP; break;
-        case _Handle.measA:  _measA  = sceneP; break;
-        case _Handle.measB:  _measB  = sceneP; break;
-        case _Handle.none: break;
-      }
-    });
-  }
-
-  void _onPanEnd(DragEndDetails d) {
-    if (_scalingActive) return;
-    setState(() => _dragging = _Handle.none);
-  }
-
-  void _onTapDown(TapDownDetails d) {
-    if (_scalingActive) return;
-    final sceneP = _toScene(d.localPosition);
-    final grabbed = _hitTestScene(sceneP);
-    if (grabbed != _Handle.none) {
-      setState(() => _dragging = grabbed); // arm it for immediate drag
-      return;
-    }
-
-    setState(() {
-      if (_mode == MeasureMode.calibrate) {
-        if (_calibA == null) _calibA = sceneP;
-        else if (_calibB == null) _calibB = sceneP;
-        else {
-          final dA = (_calibA! - sceneP).distance;
-          final dB = (_calibB! - sceneP).distance;
-          if (dA <= dB) _calibA = sceneP; else _calibB = sceneP;
-        }
-      } else {
-        if (_measA == null) _measA = sceneP;
-        else if (_measB == null) _measB = sceneP;
-        else {
-          final dA = (_measA! - sceneP).distance;
-          final dB = (_measB! - sceneP).distance;
-          if (dA <= dB) _measA = sceneP; else _measB = sceneP;
-        }
-      }
-    });
-  }
-
-  // TWO-FINGER: custom pinch + pan (no InteractiveViewer)
-  void _onScaleStart(ScaleStartDetails d) {
-    if (d.pointerCount < 2) return;
-    _scalingActive = true;
-    _startMatrix = _xfm.value.clone();
-    _startScale = _startMatrix!.getMaxScaleOnAxis();
-    _startSceneFocal = _toScene(d.localFocalPoint, _startMatrix);
   }
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
-    if (!_scalingActive || _startMatrix == null || d.pointerCount < 2) return;
+    if (_imageSize == null) return;
+    final img = _imageSize!;
+    final vp = Size(img.width, img.height); // our canvas is sized to the image
 
-    final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
-    final focalV = d.localFocalPoint;
-    final sceneFocal = _startSceneFocal;
+    if (_gMode == _GestureMode.pinchZoom && d.pointerCount >= 2) {
+      final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
+      final focalV = d.localFocalPoint;
+      final sceneFocal = _startSceneFocal;
 
-    final next = Matrix4.identity()
-      ..translate(focalV.dx, focalV.dy)
-      ..scale(desiredScale)
-      ..translate(-sceneFocal.dx, -sceneFocal.dy);
+      // Build matrix that keeps the same scene point under the fingers
+      Matrix4 next = Matrix4.identity()
+        ..translate(focalV.dx, focalV.dy)
+        ..scale(desiredScale)
+        ..translate(-sceneFocal.dx, -sceneFocal.dy);
 
-    // Allow panning while zoomed by adding focal delta
-    if (desiredScale > 1.0) {
-      next.translate(d.focalPointDelta.dx, d.focalPointDelta.dy);
+      // Allow panning while zoomed via focal delta
+      if (desiredScale > 1.0) {
+        next.translate(d.focalPointDelta.dx, d.focalPointDelta.dy);
+      }
+
+      // Clamp so image can’t leave viewport bounds
+      next = _clampMatrix(next, vp, img);
+
+      setState(() => _xfm.value = next);
+      return;
     }
 
-    setState(() => _xfm.value = next);
+    if (_gMode == _GestureMode.singleEdit && d.pointerCount == 1) {
+      final curViewport = d.localFocalPoint;
+      if ((curViewport - _singleStartViewport).distance > _tapSlop) {
+        _singleMoved = true;
+      }
+      final curScene = _toScene(curViewport);
+
+      if (_dragging != _Handle.none) {
+        setState(() {
+          switch (_dragging) {
+            case _Handle.calibA: _calibA = curScene; break;
+            case _Handle.calibB: _calibB = curScene; break;
+            case _Handle.measA:  _measA  = curScene; break;
+            case _Handle.measB:  _measB  = curScene; break;
+            case _Handle.none: break;
+          }
+        });
+      } else if (_singleMoved) {
+        // Not grabbed a handle; start/extend line in active mode while dragging
+        setState(() {
+          if (_mode == MeasureMode.calibrate) {
+            if (_calibA == null || (_calibA != null && _calibB != null)) {
+              _calibA = _singleStartScene; _calibB = curScene; _dragging = _Handle.calibB;
+            } else {
+              _calibB = curScene; _dragging = _Handle.calibB;
+            }
+          } else {
+            if (_measA == null || (_measA != null && _measB != null)) {
+              _measA = _singleStartScene; _measB = curScene; _dragging = _Handle.measB;
+            } else {
+              _measB = curScene; _dragging = _Handle.measB;
+            }
+          }
+        });
+      }
+    }
   }
 
   void _onScaleEnd(ScaleEndDetails d) {
-    _scalingActive = false;
-    _startMatrix = null;
+    if (_imageSize == null) return;
+
+    if (_gMode == _GestureMode.pinchZoom) {
+      _gMode = _GestureMode.none;
+      _startMatrix = null;
+      return;
+    }
+
+    if (_gMode == _GestureMode.singleEdit) {
+      // Treat as a tap if we didn’t move much
+      if (!_singleMoved) {
+        final sceneP = _singleStartScene;
+        final grabbed = _hitTestScene(sceneP);
+        if (grabbed != _Handle.none) {
+          setState(() => _dragging = grabbed); // arm for immediate drag next touch
+        } else {
+          setState(() {
+            if (_mode == MeasureMode.calibrate) {
+              if (_calibA == null) _calibA = sceneP;
+              else if (_calibB == null) _calibB = sceneP;
+              else {
+                final dA = (_calibA! - sceneP).distance;
+                final dB = (_calibB! - sceneP).distance;
+                if (dA <= dB) _calibA = sceneP; else _calibB = sceneP;
+              }
+            } else {
+              if (_measA == null) _measA = sceneP;
+              else if (_measB == null) _measB = sceneP;
+              else {
+                final dA = (_measA! - sceneP).distance;
+                final dB = (_measB! - sceneP).distance;
+                if (dA <= dB) _measA = sceneP; else _measB = sceneP;
+              }
+            }
+          });
+        }
+      }
+      _gMode = _GestureMode.none;
+      _dragging = _Handle.none;
+      return;
+    }
   }
 
-  // ===== Double-tap zoom =====
+  // Double-tap zoom (center on tap position)
   void _animateTo(Matrix4 target) {
     _animCtrl?.dispose();
     _animCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 180));
@@ -254,17 +329,28 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     _animCtrl!.forward();
   }
 
-  void _resetZoom() => _animateTo(Matrix4.identity());
+  void _resetZoom() {
+    if (_imageSize == null) return;
+    final img = _imageSize!;
+    final vp = Size(img.width, img.height);
+    final id = Matrix4.identity();
+    setState(() => _xfm.value = _clampMatrix(id, vp, img));
+  }
 
   void _onDoubleTapDown(TapDownDetails d) {
+    if (_imageSize == null) return;
+    final img = _imageSize!;
+    final vp = Size(img.width, img.height);
+
     final currentScale = _scale;
     final targetScale = currentScale < 2.0 ? 2.5 : 1.0;
     final f = d.localPosition;
     final sceneAtTap = _toScene(f);
-    final m = Matrix4.identity()
+    Matrix4 m = Matrix4.identity()
       ..translate(f.dx, f.dy)
       ..scale(targetScale)
       ..translate(-sceneAtTap.dx, -sceneAtTap.dy);
+    m = _clampMatrix(m, vp, img);
     _animateTo(m);
   }
 
@@ -275,7 +361,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     if (!_calibrationReady) { _snack('Tap/drag two calibration points first.'); return; }
     final known = double.tryParse(_knownLengthFt.text);
     if (known == null || known <= 0) { _snack('Enter a valid known length (ft).'); return; }
-
     final px = _dist(_calibA!, _calibB!);
     if (px <= 0) { _snack('Calibration points overlap.'); return; }
 
@@ -291,7 +376,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _compute() {
     if (_pxPerFt == null) { _snack('Set calibration first.'); return; }
     if (!_measurementReady) { _snack('Place two measurement points (tap or drag).'); return; }
-
     final ft = _dist(_measA!, _measB!) / _pxPerFt!;
     setState(() => _measuredFeet = ft);
     _snack('Depth = ${ft.toStringAsFixed(2)} ft');
@@ -339,7 +423,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                 child: Stack(
                   clipBehavior: Clip.hardEdge,
                   children: [
-                    // Transformed image
+                    // Transformed image (clamped every frame)
                     AnimatedBuilder(
                       animation: _xfm,
                       builder: (_, __) => Transform(
@@ -352,18 +436,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                       ),
                     ),
 
-                    // Gesture + overlay (scene is drawn under same transform)
+                    // Gesture + overlay (also drawn in scene space via same transform)
                     Positioned.fill(
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
 
-                        // Single-finger edit
-                        onTapDown: _onTapDown,
-                        onPanStart: _onPanStart,
-                        onPanUpdate: _onPanUpdate,
-                        onPanEnd: _onPanEnd,
-
-                        // Two-finger pinch+pan (custom)
+                        // One recognizer for all: single + two-finger
                         onScaleStart: _onScaleStart,
                         onScaleUpdate: _onScaleUpdate,
                         onScaleEnd: _onScaleEnd,
@@ -575,7 +653,6 @@ class _OverlayPainter extends CustomPainter {
       canvas.drawLine(a, b, lineHalo);
       canvas.drawLine(a, b, line);
 
-      // midpoint tick
       final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
       final midFill = Paint()
         ..color = (line == blueLine) ? const Color(0xFF1565C0) : const Color(0xFF2E7D32)

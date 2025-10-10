@@ -26,7 +26,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Scene-space points
+  // Scene-space points (image pixel space)
   Offset? _calibA, _calibB, _measA, _measB;
   _Handle _dragging = _Handle.none;
 
@@ -37,11 +37,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   // Image size (intrinsic)
   Size? _imageSize;
 
-  // Visual tuning
-  static const double _dotRadius = 8;
-  static const double _haloRadius = 10;
-  static const double _stroke = 4;
-  static const double _midTickR = 3;
+  // Visual tuning (screen-space base sizes; painter will keep them constant on screen)
+  static const double _dotRadiusBase = 6;
+  static const double _haloRadiusBase = 8;
+  static const double _strokeBase = 3;
+  static const double _midTickBase = 3;
   static const double _hitRadiusScreen = 36;
 
   bool get _calibrationReady => _calibA != null && _calibB != null;
@@ -56,6 +56,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Matrix4? _startMatrix;
   double _startScale = 1.0;
   Offset _startSceneFocal = Offset.zero;
+
+  // Pointer tracking (prevents accidental taps when a second finger joins quickly)
+  int _activePointers = 0;
+  bool _everMultitouch = false;
 
   // Track fingers across a gesture to suppress accidental taps
   int _gestureMaxPointers = 0;
@@ -111,6 +115,14 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     return Offset(v.x, v.y);
   }
 
+  Offset _clampToImage(Offset p) {
+    final sz = _imageSize!;
+    return Offset(
+      p.dx.clamp(0.0, sz.width),
+      p.dy.clamp(0.0, sz.height),
+    );
+  }
+
   Matrix4 _clampMatrix(Matrix4 m, Size viewport, Size image) {
     final scale = m.getMaxScaleOnAxis().clamp(_minScale, _maxScale);
     final tx = m.storage[12], ty = m.storage[13];
@@ -143,20 +155,42 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       if (dist < bestD) { best = h; bestD = dist; }
     }
 
-    check(_Handle.calibA, _calibA);
-    check(_Handle.calibB, _calibB);
-    check(_Handle.measA, _measA);
-    check(_Handle.measB, _measB);
-
-    if (_mode == MeasureMode.calibrate &&
-        (best == _Handle.measA || best == _Handle.measB)) return _Handle.none;
-    if (_mode == MeasureMode.measure &&
-        (best == _Handle.calibA || best == _Handle.calibB)) return _Handle.none;
-
+    // Only hit-test points for the active mode
+    if (_mode == MeasureMode.calibrate) {
+      check(_Handle.calibA, _calibA);
+      check(_Handle.calibB, _calibB);
+    } else {
+      check(_Handle.measA, _measA);
+      check(_Handle.measB, _measB);
+    }
     return best;
   }
 
-  // ---------- Unified gestures (solve accidental taps + drift)
+  // ---------- Pointer listener: detects second finger ASAP
+  void _onPointerDown(PointerDownEvent e) {
+    _activePointers++;
+    if (_activePointers >= 2) {
+      _everMultitouch = true;
+      // If we were in a single-finger edit, immediately switch to pinch mode
+      if (_gMode == _GestureMode.singleEdit) {
+        _gMode = _GestureMode.pinchZoom;
+        _startMatrix = _xfm.value.clone();
+        _startScale = _startMatrix!.getMaxScaleOnAxis();
+        _startSceneFocal = _toScene(e.localPosition, _startMatrix);
+        _dragging = _Handle.none;
+      }
+    }
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    _activePointers = (_activePointers - 1).clamp(0, 10);
+    if (_activePointers == 0) {
+      // New gesture next time
+      _everMultitouch = false;
+    }
+  }
+
+  // ---------- Unified gestures
   void _onScaleStart(ScaleStartDetails d) {
     if (_imageSize == null) return;
 
@@ -196,7 +230,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
     if (_gMode == _GestureMode.singleEdit) {
       // If a second finger joins, switch to pinch mode and cancel edit (no point placement)
-      if (_gestureMaxPointers >= 2) {
+      if (_gestureMaxPointers >= 2 || _everMultitouch) {
         _gMode = _GestureMode.pinchZoom;
         _startMatrix = _xfm.value.clone();
         _startScale = _startMatrix!.getMaxScaleOnAxis();
@@ -210,7 +244,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       if ((curViewport - _singleStartViewport).distance > _tapSlop) {
         _singleMoved = true;
       }
-      final curScene = _toScene(curViewport);
+      final curSceneRaw = _toScene(curViewport);
+      final curScene = _clampToImage(curSceneRaw);
 
       if (_dragging != _Handle.none) {
         setState(() {
@@ -226,13 +261,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         setState(() {
           if (_mode == MeasureMode.calibrate) {
             if (_calibA == null || (_calibA != null && _calibB != null)) {
-              _calibA = _singleStartScene; _calibB = curScene; _dragging = _Handle.calibB;
+              _calibA = _clampToImage(_singleStartScene); _calibB = curScene; _dragging = _Handle.calibB;
             } else {
               _calibB = curScene; _dragging = _Handle.calibB;
             }
           } else {
             if (_measA == null || (_measA != null && _measB != null)) {
-              _measA = _singleStartScene; _measB = curScene; _dragging = _Handle.measB;
+              _measA = _clampToImage(_singleStartScene); _measB = curScene; _dragging = _Handle.measB;
             } else {
               _measB = curScene; _dragging = _Handle.measB;
             }
@@ -243,7 +278,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     }
 
     if (_gMode == _GestureMode.pinchZoom) {
-      // Build next transform that keeps the same *scene* point under the fingers.
+      // Keep the same scene point under the fingers (no drift)
       final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
       final focalV = d.localFocalPoint;
 
@@ -252,12 +287,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         ..scale(desiredScale)
         ..translate(-_startSceneFocal.dx, -_startSceneFocal.dy);
 
-      // NOTE: No extra focalPointDelta translation here — that was the
-      // source of subtle drift between image and overlay.
+      // No focalPointDelta translation — avoids subtle overlay drift.
 
-      // Update immediately (no clamp mid-gesture to avoid micro jumps)
-      _xfm.value = next;
-      setState(() {}); // ensure overlay rebuilds same frame
+      _xfm.value = next;          // update continuously
+      setState(() {});            // ensure overlay repaints same frame
       return;
     }
   }
@@ -274,12 +307,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       _gMode = _GestureMode.none;
       _startMatrix = null;
       _gestureMaxPointers = 0;
+      // do not reset _everMultitouch here; it resets when all pointers up
       return;
     }
 
     if (_gMode == _GestureMode.singleEdit) {
-      // If at any time during this gesture we had 2+ fingers, treat it as pinch → no tap
-      if (_gestureMaxPointers >= 2) {
+      // If at any time during this gesture we had 2+ fingers, or pointer listener saw multitouch: cancel tap
+      if (_gestureMaxPointers >= 2 || _everMultitouch) {
         _gMode = _GestureMode.none;
         _dragging = _Handle.none;
         _gestureMaxPointers = 0;
@@ -287,7 +321,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       }
 
       if (!_singleMoved) {
-        final sceneP = _singleStartScene;
+        final sceneP = _clampToImage(_singleStartScene);
         final grabbed = _hitTestScene(sceneP);
         if (grabbed != _Handle.none) {
           setState(() => _dragging = grabbed); // will drag on next move
@@ -367,6 +401,9 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     setState(() {
       _pxPerUnit = px / known;
       _mode = MeasureMode.measure;
+      // Clear calibration points so they disappear and only green points remain
+      _calibA = null;
+      _calibB = null;
       _measA = _measB = null;
       _measuredValue = null;
     });
@@ -396,6 +433,8 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       _dragging = _Handle.none;
       _unit = UnitSystem.feet;
       _xfm.value = Matrix4.identity();
+      _activePointers = 0;
+      _everMultitouch = false;
     });
     _snack('Reset. Choose unit, enter length, set two blue points.');
   }
@@ -438,28 +477,33 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                           ),
                         ),
                       ),
-                      // Gesture + overlay (scene space via same transform)
+                      // Pointer listener wraps gestures to catch second finger ASAP
                       Positioned.fill(
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onScaleStart: _onScaleStart,
-                          onScaleUpdate: _onScaleUpdate,
-                          onScaleEnd: _onScaleEnd,
-                          onDoubleTapDown: _onDoubleTapDown,
-                          onDoubleTap: () {},
-                          child: AnimatedBuilder(
-                            animation: _xfm,
-                            builder: (_, __) => Transform(
-                              transform: _xfm.value,
-                              child: CustomPaint(
-                                size: Size(imgW, imgH),
-                                painter: _OverlayPainter(
-                                  calibA: _calibA, calibB: _calibB,
-                                  measA: _measA,   measB: _measB,
-                                  dotRadius: _dotRadius,
-                                  haloRadius: _haloRadius,
-                                  stroke: _stroke,
-                                  midTickR: _midTickR,
+                        child: Listener(
+                          onPointerDown: _onPointerDown,
+                          onPointerUp: _onPointerUp,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onScaleStart: _onScaleStart,
+                            onScaleUpdate: _onScaleUpdate,
+                            onScaleEnd: _onScaleEnd,
+                            onDoubleTapDown: _onDoubleTapDown,
+                            onDoubleTap: () {},
+                            child: AnimatedBuilder(
+                              animation: _xfm,
+                              builder: (_, __) => Transform(
+                                transform: _xfm.value,
+                                child: CustomPaint(
+                                  size: Size(imgW, imgH),
+                                  painter: _OverlayPainter(
+                                    calibA: _calibA, calibB: _calibB,
+                                    measA: _measA,   measB: _measB,
+                                    // keep visuals constant on-screen by dividing by scale
+                                    dotRadiusScene: _dotRadiusBase / _scale,
+                                    haloRadiusScene: _haloRadiusBase / _scale,
+                                    strokeScene: (_strokeBase / _scale).clamp(1.0, double.infinity),
+                                    midTickRScene: (_midTickBase / _scale).clamp(1.0, double.infinity),
+                                  ),
                                 ),
                               ),
                             ),
@@ -497,7 +541,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                     child: DropdownButtonHideUnderline(
                       child: DropdownButton<UnitSystem>(
                         value: _unit,
-                        onChanged: (u) => setState(() => _unit = u!),
+                        onChanged: (u) => setState(() {
+                          _unit = u!;
+                          // Changing units invalidates calibration/measurements
+                          _pxPerUnit = null;
+                          _measuredValue = null;
+                        }),
                         items: const [
                           DropdownMenuItem(value: UnitSystem.feet, child: Text('Feet')),
                           DropdownMenuItem(value: UnitSystem.meters, child: Text('Meters')),
@@ -623,17 +672,18 @@ class _Box extends StatelessWidget {
 
 class _OverlayPainter extends CustomPainter {
   final Offset? calibA, calibB, measA, measB;
-  final double dotRadius, haloRadius, stroke, midTickR;
+  // these are already converted to scene-units so they stay constant on screen
+  final double dotRadiusScene, haloRadiusScene, strokeScene, midTickRScene;
 
   _OverlayPainter({
     required this.calibA,
     required this.calibB,
     required this.measA,
     required this.measB,
-    required this.dotRadius,
-    required this.haloRadius,
-    required this.stroke,
-    required this.midTickR,
+    required this.dotRadiusScene,
+    required this.haloRadiusScene,
+    required this.strokeScene,
+    required this.midTickRScene,
   });
 
   @override
@@ -655,29 +705,29 @@ class _OverlayPainter extends CustomPainter {
 
     final lineHalo = Paint()
       ..color = Colors.black.withOpacity(0.35)
-      ..strokeWidth = stroke + 3
+      ..strokeWidth = strokeScene + 3
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke
       ..isAntiAlias = true;
 
     final blueLine = Paint()
       ..color = const Color(0xFF1565C0)
-      ..strokeWidth = stroke
+      ..strokeWidth = strokeScene
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke
       ..isAntiAlias = true;
 
     final greenLine = Paint()
       ..color = const Color(0xFF2E7D32)
-      ..strokeWidth = stroke
+      ..strokeWidth = strokeScene
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke
       ..isAntiAlias = true;
 
     void point(Offset? p, Paint color) {
       if (p == null) return;
-      canvas.drawCircle(p, haloRadius, whiteHalo);
-      canvas.drawCircle(p, dotRadius, color);
+      canvas.drawCircle(p, haloRadiusScene, whiteHalo);
+      canvas.drawCircle(p, dotRadiusScene, color);
     }
 
     void drawSegment(Offset? a, Offset? b, Paint line) {
@@ -695,11 +745,11 @@ class _OverlayPainter extends CustomPainter {
         ..strokeWidth = 2
         ..style = PaintingStyle.stroke
         ..isAntiAlias = true;
-      canvas.drawCircle(mid, midTickR, midFill);
-      canvas.drawCircle(mid, midTickR, midStroke);
+      canvas.drawCircle(mid, midTickRScene, midFill);
+      canvas.drawCircle(mid, midTickRScene, midStroke);
     }
 
-    // Calibrate (blue)
+    // Calibrate (blue) — only if present (they’re cleared after Set calibration)
     point(calibA, blue);
     point(calibB, blue);
     drawSegment(calibA, calibB, blueLine);
@@ -716,9 +766,9 @@ class _OverlayPainter extends CustomPainter {
         old.calibB != calibB ||
         old.measA != measA ||
         old.measB != measB ||
-        old.dotRadius != dotRadius ||
-        old.haloRadius != haloRadius ||
-        old.stroke != stroke ||
-        old.midTickR != midTickR;
+        old.dotRadiusScene != dotRadiusScene ||
+        old.haloRadiusScene != haloRadiusScene ||
+        old.strokeScene != strokeScene ||
+        old.midTickRScene != midTickRScene;
   }
 }

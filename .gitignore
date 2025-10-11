@@ -43,3 +43,13 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Flutter build outputs
+**/build/
+artifacts/
+
+# Local signing / secrets
+signing/
+
+# Flutter metadata (optional)
+.metadata

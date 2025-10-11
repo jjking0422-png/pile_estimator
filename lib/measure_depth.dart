@@ -18,24 +18,30 @@ enum _GestureMode { none, singleEdit, pinchZoom }
 
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
-  // Known length input (imperial feet + inches)
+  // Known length input (imperial)
   final TextEditingController _knownLengthCtrl =
-      TextEditingController(text: '4 ft');
+      TextEditingController(text: '21.5 in'); // your example
 
   MeasureMode _mode = MeasureMode.calibrate;
 
-  // Points in scene space
+  // Points in scene space (image pixel coordinates)
   Offset? _calibA, _calibB, _measA, _measB;
   _Handle _dragging = _Handle.none;
 
   // Calibration
-  double? _pxPerInch;
-  double? _measuredInches;
+  double? _pxPerInch;        // pixels per inch
+  double? _measuredInches;   // last computed measurement in inches
+  double? _knownInchesCache; // for diagnostics
+  double? _calibPxCache;     // for diagnostics
+  double? _measPxCache;      // for diagnostics
 
-  // Image size
+  // Image
   Size? _imageSize;
 
-  // Visual tuning (kept constant on screen)
+  // Viewport tracking (actual on-screen widget size for proper clamping)
+  Size _viewportSize = const Size(0, 0);
+
+  // Visual tuning (constant on screen)
   static const double _dotRadiusBase = 6;
   static const double _haloRadiusBase = 8;
   static const double _strokeBase = 3;
@@ -45,7 +51,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   bool get _calibrationReady => _calibA != null && _calibB != null;
   bool get _measurementReady => _measA != null && _measB != null;
 
-  // Gesture + transform state
+  // Transform / gesture state
   final TransformationController _xfm = TransformationController();
   AnimationController? _animCtrl;
   Animation<Matrix4>? _zoomAnim;
@@ -55,10 +61,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   double _startScale = 1.0;
   Offset _startSceneFocal = Offset.zero;
 
+  // Pointer tracking to suppress accidental taps on pinch
   int _activePointers = 0;
   bool _everMultitouch = false;
   int _gestureMaxPointers = 0;
 
+  // Single-finger state
   Offset _singleStartViewport = Offset.zero;
   Offset _singleStartScene = Offset.zero;
   bool _singleMoved = false;
@@ -90,8 +98,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     listener = ImageStreamListener((info, _) {
       if (!mounted) return;
       setState(() {
-        _imageSize =
-            Size(info.image.width.toDouble(), info.image.height.toDouble());
+        _imageSize = Size(info.image.width.toDouble(), info.image.height.toDouble());
       });
       stream.removeListener(listener!);
     }, onError: (_, __) {
@@ -102,7 +109,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     stream.addListener(listener);
   }
 
-  // ================= MATH HELPERS =================
+  // ---------- Math helpers ----------
   Offset _toScene(Offset viewportPoint, [Matrix4? matrix]) {
     final m = (matrix ?? _xfm.value).clone()..invert();
     final v = m.transform3(Vector3(viewportPoint.dx, viewportPoint.dy, 0));
@@ -118,33 +125,28 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   Matrix4 _clampMatrix(Matrix4 m, Size viewport, Size image) {
+    // Clamp translation and scale so the image stays inside the viewport
     final scale = m.getMaxScaleOnAxis().clamp(_minScale, _maxScale);
     final tx = m.storage[12], ty = m.storage[13];
     final scaledW = image.width * scale, scaledH = image.height * scale;
 
     double minTx, maxTx, minTy, maxTy;
     if (scaledW <= viewport.width) {
-      final cx = (viewport.width - scaledW) / 2.0;
-      minTx = maxTx = cx;
-    } else {
-      maxTx = 0.0;
-      minTx = viewport.width - scaledW;
-    }
+      final cx = (viewport.width - scaledW) / 2.0; minTx = maxTx = cx;
+    } else { maxTx = 0.0; minTx = viewport.width - scaledW; }
 
     if (scaledH <= viewport.height) {
-      final cy = (viewport.height - scaledH) / 2.0;
-      minTy = maxTy = cy;
-    } else {
-      maxTy = 0.0;
-      minTy = viewport.height - scaledH;
-    }
+      final cy = (viewport.height - scaledH) / 2.0; minTy = maxTy = cy;
+    } else { maxTy = 0.0; minTy = viewport.height - scaledH; }
 
     return Matrix4.identity()
       ..translate(tx.clamp(minTx, maxTx), ty.clamp(minTy, maxTy))
       ..scale(scale);
   }
 
-  // ================= HIT TEST =================
+  double _dist(Offset a, Offset b) => (a - b).distance;
+
+  // ---------- Hit testing ----------
   _Handle _hitTestScene(Offset sceneP) {
     double d(Offset? a) => a == null ? 1e9 : (sceneP - a).distance;
     final hitScene = _hitRadiusScreen / _scale.clamp(1.0, 100.0);
@@ -154,10 +156,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
     void check(_Handle h, Offset? p) {
       final dist = d(p);
-      if (dist < bestD) {
-        best = h;
-        bestD = dist;
-      }
+      if (dist < bestD) { best = h; bestD = dist; }
     }
 
     if (_mode == MeasureMode.calibrate) {
@@ -170,7 +169,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     return best;
   }
 
-  // ================= POINTER / GESTURE =================
+  // ---------- Pointer / gestures ----------
   void _onPointerDown(PointerDownEvent e) {
     _activePointers++;
     if (_activePointers >= 2) {
@@ -192,7 +191,9 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   void _onScaleStart(ScaleStartDetails d) {
     if (_imageSize == null) return;
+
     _gestureMaxPointers = d.pointerCount;
+
     if (d.pointerCount >= 2) {
       _gMode = _GestureMode.pinchZoom;
       _startMatrix = _xfm.value.clone();
@@ -209,13 +210,12 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
     final grabbed = _hitTestScene(_singleStartScene);
     _dragging = grabbed;
-    if (grabbed != _Handle.none) {
-      HapticFeedback.selectionClick();
-    }
+    if (grabbed != _Handle.none) HapticFeedback.selectionClick();
   }
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
     if (_imageSize == null) return;
+
     if (d.pointerCount > _gestureMaxPointers) {
       _gestureMaxPointers = d.pointerCount;
     }
@@ -231,50 +231,29 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       }
 
       final curViewport = d.localFocalPoint;
-      if ((curViewport - _singleStartViewport).distance > _tapSlop) {
-        _singleMoved = true;
-      }
+      if ((curViewport - _singleStartViewport).distance > _tapSlop) _singleMoved = true;
       final curScene = _clampToImage(_toScene(curViewport));
 
       if (_dragging != _Handle.none) {
         setState(() {
           switch (_dragging) {
-            case _Handle.calibA:
-              _calibA = curScene;
-              break;
-            case _Handle.calibB:
-              _calibB = curScene;
-              break;
-            case _Handle.measA:
-              _measA = curScene;
-              break;
-            case _Handle.measB:
-              _measB = curScene;
-              break;
-            case _Handle.none:
-              break;
+            case _Handle.calibA: _calibA = curScene; break;
+            case _Handle.calibB: _calibB = curScene; break;
+            case _Handle.measA:  _measA  = curScene; break;
+            case _Handle.measB:  _measB  = curScene; break;
+            case _Handle.none: break;
           }
         });
       } else if (_singleMoved) {
         setState(() {
           if (_mode == MeasureMode.calibrate) {
             if (_calibA == null || (_calibA != null && _calibB != null)) {
-              _calibA = _clampToImage(_singleStartScene);
-              _calibB = curScene;
-              _dragging = _Handle.calibB;
-            } else {
-              _calibB = curScene;
-              _dragging = _Handle.calibB;
-            }
+              _calibA = _clampToImage(_singleStartScene); _calibB = curScene; _dragging = _Handle.calibB;
+            } else { _calibB = curScene; _dragging = _Handle.calibB; }
           } else {
             if (_measA == null || (_measA != null && _measB != null)) {
-              _measA = _clampToImage(_singleStartScene);
-              _measB = curScene;
-              _dragging = _Handle.measB;
-            } else {
-              _measB = curScene;
-              _dragging = _Handle.measB;
-            }
+              _measA = _clampToImage(_singleStartScene); _measB = curScene; _dragging = _Handle.measB;
+            } else { _measB = curScene; _dragging = _Handle.measB; }
           }
         });
       }
@@ -284,12 +263,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     if (_gMode == _GestureMode.pinchZoom) {
       final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
       final focalV = d.localFocalPoint;
-
       Matrix4 next = Matrix4.identity()
         ..translate(focalV.dx, focalV.dy)
         ..scale(desiredScale)
         ..translate(-_startSceneFocal.dx, -_startSceneFocal.dy);
-
       _xfm.value = next;
       setState(() {});
     }
@@ -298,11 +275,9 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _onScaleEnd(ScaleEndDetails d) {
     if (_imageSize == null) return;
 
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
-
     if (_gMode == _GestureMode.pinchZoom) {
-      setState(() => _xfm.value = _clampMatrix(_xfm.value, vp, img));
+      // Use the ACTUAL viewport for clamping
+      setState(() => _xfm.value = _clampMatrix(_xfm.value, _viewportSize, _imageSize!));
       _gMode = _GestureMode.none;
       _startMatrix = null;
       _gestureMaxPointers = 0;
@@ -321,34 +296,24 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         final sceneP = _clampToImage(_singleStartScene);
         final grabbed = _hitTestScene(sceneP);
         if (grabbed != _Handle.none) {
-          setState(() => _dragging = grabbed);
+          setState(() => _dragging = grabbed); // will drag on next move
         } else {
           setState(() {
             if (_mode == MeasureMode.calibrate) {
-              if (_calibA == null)
-                _calibA = sceneP;
-              else if (_calibB == null)
-                _calibB = sceneP;
+              if (_calibA == null) _calibA = sceneP;
+              else if (_calibB == null) _calibB = sceneP;
               else {
                 final dA = (_calibA! - sceneP).distance;
                 final dB = (_calibB! - sceneP).distance;
-                if (dA <= dB)
-                  _calibA = sceneP;
-                else
-                  _calibB = sceneP;
+                if (dA <= dB) _calibA = sceneP; else _calibB = sceneP;
               }
             } else {
-              if (_measA == null)
-                _measA = sceneP;
-              else if (_measB == null)
-                _measB = sceneP;
+              if (_measA == null) _measA = sceneP;
+              else if (_measB == null) _measB = sceneP;
               else {
                 final dA = (_measA! - sceneP).distance;
                 final dB = (_measB! - sceneP).distance;
-                if (dA <= dB)
-                  _measA = sceneP;
-                else
-                  _measB = sceneP;
+                if (dA <= dB) _measA = sceneP; else _measB = sceneP;
               }
             }
           });
@@ -360,11 +325,10 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     }
   }
 
-  // ================= DOUBLE TAP ZOOM =================
+  // ---------- Double-tap zoom ----------
   void _animateTo(Matrix4 target) {
     _animCtrl?.dispose();
-    _animCtrl = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 180));
+    _animCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 180));
     _zoomAnim = Matrix4Tween(begin: _xfm.value, end: target).animate(
       CurvedAnimation(parent: _animCtrl!, curve: Curves.easeOutCubic),
     )..addListener(() => setState(() => _xfm.value = _zoomAnim!.value));
@@ -373,16 +337,11 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   void _resetZoom() {
     if (_imageSize == null) return;
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
-    setState(() => _xfm.value = _clampMatrix(Matrix4.identity(), vp, img));
+    setState(() => _xfm.value = _clampMatrix(Matrix4.identity(), _viewportSize, _imageSize!));
   }
 
   void _onDoubleTapDown(TapDownDetails d) {
     if (_imageSize == null) return;
-    final img = _imageSize!;
-    final vp = Size(img.width, img.height);
-
     final currentScale = _scale;
     final targetScale = currentScale < 2.0 ? 2.5 : 1.0;
     final f = d.localPosition;
@@ -391,27 +350,30 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       ..translate(f.dx, f.dy)
       ..scale(targetScale)
       ..translate(-sceneAtTap.dx, -sceneAtTap.dy);
-    m = _clampMatrix(m, vp, img);
+    m = _clampMatrix(m, _viewportSize, _imageSize!);
     _animateTo(m);
   }
 
-  // ================= IMPERIAL PARSER =================
+  // ---------- Imperial parsing / formatting ----------
+  // Accepts: 5' 7.5", 5ft 7.5in, 5-7.5, 4.5 ft, 54 in, 21 1/2 in, 21.5"
   double? _parseImperialToInches(String raw) {
     String s = raw.trim().toLowerCase().replaceAll(',', ' ');
     if (s.isEmpty) return null;
+
     s = s
         .replaceAll('feet', 'ft')
         .replaceAll('foot', 'ft')
         .replaceAll('inches', 'in')
         .replaceAll('inch', 'in')
+        .replaceAll('”', 'in')
+        .replaceAll('″', 'in')
         .replaceAll('"', 'in')
-        .replaceAll("”", 'in')
-        .replaceAll("″", 'in')
-        .replaceAll("’", "'")
-        .replaceAll("′", "'")
-        .replaceAll('  ', ' ');
+        .replaceAll('’', "'")
+        .replaceAll('′', "'")
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
 
-    // ft-in pattern e.g. 5' 7.5", 5ft 7.5in, 5-7.5
+    // 1) ft-in (e.g., 5' 7.5", 5ft 7.5in, 5-7.5)
     final ftIn = RegExp(
       "^\\s*(\\d+(?:\\.\\d+)?)\\s*(?:ft|'|-)\\s*(\\d+(?:\\.\\d+)?)\\s*(?:in)?\\s*\$",
       caseSensitive: false,
@@ -423,7 +385,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       if (ft != null && inch != null) return ft * 12 + inch;
     }
 
-    // just feet
+    // 2) feet only (decimal ok): "4.5 ft" or "4.5"
     final justFt = RegExp("^\\s*(\\d+(?:\\.\\d+)?)\\s*(?:ft)?\\s*\$");
     final m2 = justFt.firstMatch(s);
     if (m2 != null && s.contains('ft')) {
@@ -435,7 +397,18 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       if (ft != null) return ft * 12;
     }
 
-    // just inches
+    // 3) inches only (supports simple fraction like 21 1/2 in)
+    final fracIn = RegExp("^\\s*(\\d+)\\s+(\\d+)\\s*/\\s*(\\d+)\\s*in\\s*\$");
+    final m3f = fracIn.firstMatch(s);
+    if (m3f != null) {
+      final whole = double.tryParse(m3f.group(1)!);
+      final num = double.tryParse(m3f.group(2)!);
+      final den = double.tryParse(m3f.group(3)!);
+      if (whole != null && num != null && den != null && den != 0) {
+        return whole + (num / den);
+      }
+    }
+
     final justIn = RegExp("^\\s*(\\d+(?:\\.\\d+)?)\\s*in\\s*\$");
     final m3 = justIn.firstMatch(s);
     if (m3 != null) {
@@ -447,86 +420,68 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   }
 
   String _formatFeetInches(double inches, {bool withParenInches = true}) {
+    if (inches.isNaN || inches.isInfinite) return '--';
     final sixteenths = (inches * 16).round();
-    int wholeSixteenths = sixteenths;
-    final wholeInches = wholeSixteenths ~/ 16;
-    final frac16 = wholeSixteenths % 16;
+    final wholeInches = sixteenths ~/ 16;
+    final frac16 = sixteenths % 16;
 
     final feet = wholeInches ~/ 12;
-    int inchesPart = wholeInches % 12;
+    final inchesPart = wholeInches % 12;
 
-    int num = frac16;
-    int den = 16;
+    // reduce fraction
+    int num = frac16, den = 16;
     int gcd(int a, int b) => b == 0 ? a.abs() : gcd(b, a % b);
     if (num != 0) {
       final g = gcd(num, den);
-      num ~/= g;
-      den ~/= g;
+      num ~/= g; den ~/= g;
     }
 
-    final pieces = <String>[];
-    pieces.add("$feet′");
-    if (num == 0) {
-      pieces.add(" $inchesPart″");
-    } else {
-      pieces.add(" $inchesPart ${num}/${den}″");
-    }
-
-    final main = pieces.join();
-    return withParenInches
-        ? "$main (${inches.toStringAsFixed(2)} in)"
-        : main;
+    final main = (num == 0)
+        ? "$feet′ $inchesPart″"
+        : "$feet′ $inchesPart ${num}/${den}″";
+    return withParenInches ? "$main (${inches.toStringAsFixed(2)} in)" : main;
   }
 
-  // ================= CALIBRATION / DEPTH =================
-  double _dist(Offset a, Offset b) => (a - b).distance;
-
+  // ---------- Calc / flow ----------
   void _setCalibration() {
-    if (!_calibrationReady) {
-      _snack('Place two blue calibration points.');
-      return;
-    }
+    if (!_calibrationReady) { _snack('Place two blue calibration points.'); return; }
     final inches = _parseImperialToInches(_knownLengthCtrl.text);
     if (inches == null || inches <= 0) {
-      _snack('Enter a valid length (e.g., 4′ 6″, 4.5 ft, 54 in).');
+      _snack('Enter a valid length (e.g., 21.5", 21 1/2 in, 1\' 9.5").');
       return;
     }
     final px = _dist(_calibA!, _calibB!);
-    if (px <= 0) {
-      _snack('Calibration points overlap.');
-      return;
-    }
+    if (px <= 0) { _snack('Calibration points overlap.'); return; }
 
     setState(() {
       _pxPerInch = px / inches;
+      _knownInchesCache = inches;
+      _calibPxCache = px;
       _mode = MeasureMode.measure;
-      _calibA = null;
-      _calibB = null;
+      // clear blue points per your requirement
+      _calibA = _calibB = null;
       _measA = _measB = null;
       _measuredInches = null;
+      _measPxCache = null;
     });
-    _snack('Calibrated: ${_pxPerInch!.toStringAsFixed(2)} px/in. Now measure.');
+    _snack('Calibrated: ${_pxPerInch!.toStringAsFixed(3)} px/in. Now measure (green).');
   }
 
   void _compute() {
-    if (_pxPerInch == null) {
-      _snack('Set calibration first.');
-      return;
-    }
-    if (!_measurementReady) {
-      _snack('Place two green measurement points.');
-      return;
-    }
+    if (_pxPerInch == null) { _snack('Set calibration first.'); return; }
+    if (!_measurementReady) { _snack('Place two green measurement points.'); return; }
     final px = _dist(_measA!, _measB!);
     final inches = px / _pxPerInch!;
-    setState(() => _measuredInches = inches);
+    setState(() {
+      _measuredInches = inches;
+      _measPxCache = px;
+    });
     _snack('Depth = ${_formatFeetInches(inches)}');
   }
 
   void _finish() {
     if (_measuredInches == null || _measuredInches! <= 0) {
-      _snack('No depth computed yet.');
-      return;
+      _snack('No depth computed yet.'); return;
     }
     Navigator.of(context).pop<double>(_measuredInches!);
   }
@@ -534,208 +489,225 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   void _resetAll() {
     setState(() {
       _calibA = _calibB = _measA = _measB = null;
-      _pxPerInch = null;
-      _measuredInches = null;
+      _pxPerInch = null; _measuredInches = null;
+      _knownInchesCache = null; _calibPxCache = null; _measPxCache = null;
       _mode = MeasureMode.calibrate;
-      _knownLengthCtrl.text = '4 ft';
+      _knownLengthCtrl.text = '21.5 in';
       _dragging = _Handle.none;
       _xfm.value = Matrix4.identity();
       _activePointers = 0;
       _everMultitouch = false;
     });
-    _snack('Reset complete. Calibrate again.');
+    _snack('Reset. Enter known length, set two blue points.');
   }
 
-  void _snack(String m) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  void _snack(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
-  // ================= UI =================
+  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
     final imgW = _imageSize?.width ?? 400;
     final imgH = _imageSize?.height ?? 300;
 
-    final pixelsPer =
-        _pxPerInch == null ? '--' : _pxPerInch!.toStringAsFixed(2);
-    final depthText = _measuredInches == null
-        ? '--'
-        : _formatFeetInches(_measuredInches!, withParenInches: true);
-
+    // Capture the true viewport size for correct clamping
     return Scaffold(
       appBar: AppBar(
         title: const Text('Measure Depth'),
         actions: [
-          IconButton(onPressed: _resetAll, icon: const Icon(Icons.refresh)),
+          IconButton(onPressed: _resetAll, tooltip: 'Reset', icon: const Icon(Icons.refresh)),
         ],
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: Center(
-              child: ClipRect(
-                child: SizedBox(
-                  width: imgW,
-                  height: imgH,
-                  child: Stack(
-                    children: [
-                      AnimatedBuilder(
-                        animation: _xfm,
-                        builder: (_, __) => Transform(
-                          transform: _xfm.value,
-                          child: SizedBox(
-                            width: imgW,
-                            height: imgH,
-                            child:
-                                Image.file(widget.imageFile, fit: BoxFit.fill),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          _viewportSize = Size(constraints.maxWidth, constraints.maxHeight - 220 /*controls est.*/);
+
+          final pixelsPer = _pxPerInch == null ? '--' : _pxPerInch!.toStringAsFixed(3);
+          final depthText = _measuredInches == null ? '--' : _formatFeetInches(_measuredInches!, withParenInches: true);
+
+          return Column(
+            children: [
+              // IMAGE + OVERLAY
+              Expanded(
+                child: Center(
+                  child: ClipRect(
+                    child: SizedBox(
+                      width: imgW, height: imgH,
+                      child: Stack(
+                        clipBehavior: Clip.hardEdge,
+                        children: [
+                          AnimatedBuilder(
+                            animation: _xfm,
+                            builder: (_, __) => Transform(
+                              transform: _xfm.value,
+                              child: SizedBox(
+                                width: imgW, height: imgH,
+                                child: Image.file(widget.imageFile, fit: BoxFit.fill),
+                              ),
+                            ),
                           ),
-                        ),
-                      ),
-                      Positioned.fill(
-                        child: Listener(
-                          onPointerDown: _onPointerDown,
-                          onPointerUp: _onPointerUp,
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onScaleStart: _onScaleStart,
-                            onScaleUpdate: _onScaleUpdate,
-                            onScaleEnd: _onScaleEnd,
-                            onDoubleTapDown: _onDoubleTapDown,
-                            onDoubleTap: () {},
-                            child: AnimatedBuilder(
-                              animation: _xfm,
-                              builder: (_, __) => Transform(
-                                transform: _xfm.value,
-                                child: CustomPaint(
-                                  size: Size(imgW, imgH),
-                                  painter: _OverlayPainter(
-                                    calibA: _calibA,
-                                    calibB: _calibB,
-                                    measA: _measA,
-                                    measB: _measB,
-                                    dotRadiusScene: _dotRadiusBase / _scale,
-                                    haloRadiusScene: _haloRadiusBase / _scale,
-                                    strokeScene:
-                                        (_strokeBase / _scale).clamp(1.0, 999),
-                                    midTickRScene:
-                                        (_midTickBase / _scale).clamp(1.0, 999),
+                          // Pointer listener wraps gestures to catch second finger ASAP
+                          Positioned.fill(
+                            child: Listener(
+                              onPointerDown: _onPointerDown,
+                              onPointerUp: _onPointerUp,
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onScaleStart: _onScaleStart,
+                                onScaleUpdate: _onScaleUpdate,
+                                onScaleEnd: _onScaleEnd,
+                                onDoubleTapDown: _onDoubleTapDown,
+                                onDoubleTap: () {},
+                                child: AnimatedBuilder(
+                                  animation: _xfm,
+                                  builder: (_, __) => Transform(
+                                    transform: _xfm.value,
+                                    child: CustomPaint(
+                                      size: Size(imgW, imgH),
+                                      painter: _OverlayPainter(
+                                        calibA: _calibA, calibB: _calibB,
+                                        measA: _measA,   measB: _measB,
+                                        dotRadiusScene: _dotRadiusBase / _scale,
+                                        haloRadiusScene: _haloRadiusBase / _scale,
+                                        strokeScene: (_strokeBase / _scale).clamp(1.0, 999),
+                                        midTickRScene: (_midTickBase / _scale).clamp(1.0, 999),
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
                             ),
                           ),
-                        ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                _Box(
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<MeasureMode>(
-                      value: _mode,
-                      onChanged: (m) => setState(() => _mode = m!),
-                      items: const [
-                        DropdownMenuItem(
-                            value: MeasureMode.calibrate,
-                            child: Text('Calibrate')),
-                        DropdownMenuItem(
-                            value: MeasureMode.measure, child: Text('Measure')),
-                      ],
-                    ),
-                  ),
-                ),
-                if (_mode == MeasureMode.calibrate) ...[
-                  ConstrainedBox(
-                    constraints:
-                        const BoxConstraints(minWidth: 220, maxWidth: 320),
-                    child: TextField(
-                      controller: _knownLengthCtrl,
-                      keyboardType: TextInputType.text,
-                      decoration: const InputDecoration(
-                        labelText: 'Known length (ft/in)',
-                        hintText: 'e.g., 4′ 6″  |  4.5 ft  |  54 in',
-                        border: OutlineInputBorder(),
-                        contentPadding:
-                            EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+
+              // CONTROLS
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                child: Wrap(
+                  spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    _Box(
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<MeasureMode>(
+                          value: _mode,
+                          onChanged: (m) => setState(() => _mode = m!),
+                          items: const [
+                            DropdownMenuItem(value: MeasureMode.calibrate, child: Text('Calibrate')),
+                            DropdownMenuItem(value: MeasureMode.measure,   child: Text('Measure')),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                  FilledButton(
-                    onPressed: _calibrationReady ? _setCalibration : null,
-                    child: const Text('Set calibration'),
-                  ),
-                ],
-                FilledButton.icon(
-                  onPressed: _resetZoom,
-                  icon: const Icon(Icons.zoom_out_map),
-                  label: const Text('Reset zoom'),
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                        child: _statTile(
-                            'Calibration pts',
-                            _calibrationReady
-                                ? '2/2 ✓'
-                                : (_calibA == null ? '0/2' : '1/2'),
-                            Icons.tune)),
-                    const SizedBox(width: 8),
-                    Expanded(child: _statTile('Pixels / inch', pixelsPer, Icons.straighten)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                        child: _statTile(
-                            'Measure pts',
-                            _measurementReady
-                                ? '2/2 ✓'
-                                : (_measA == null ? '0/2' : '1/2'),
-                            Icons.straighten_outlined)),
-                    const SizedBox(width: 8),
-                    Expanded(child: _statTile('Depth', depthText, Icons.calculate)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    OutlinedButton.icon(
-                      onPressed: _measurementReady ? _compute : null,
-                      icon: const Icon(Icons.calculate),
-                      label: const Text('Compute depth'),
-                    ),
-                    const SizedBox(width: 8),
+                    if (_mode == MeasureMode.calibrate) ...[
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(minWidth: 220, maxWidth: 320),
+                        child: TextField(
+                          controller: _knownLengthCtrl,
+                          keyboardType: TextInputType.text,
+                          decoration: const InputDecoration(
+                            labelText: 'Known length (ft/in)',
+                            hintText: 'e.g., 21.5", 21 1/2 in, 1\' 9.5"',
+                            border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          ),
+                        ),
+                      ),
+                      FilledButton(
+                        onPressed: _calibrationReady ? _setCalibration : null,
+                        child: const Text('Set calibration'),
+                      ),
+                    ],
                     FilledButton.icon(
-                      onPressed: (_measuredInches != null &&
-                              _measuredInches! > 0)
-                          ? _finish
-                          : null,
-                      icon: const Icon(Icons.check),
-                      label: const Text('Use depth'),
+                      onPressed: _resetZoom,
+                      icon: const Icon(Icons.zoom_out_map),
+                      label: const Text('Reset zoom'),
                     ),
                   ],
                 ),
-              ],
-            ),
-          ),
-        ],
+              ),
+
+              // READOUTS + DIAGNOSTICS
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
+                        const SizedBox(width: 8),
+                        Expanded(child: _statTile('Pixels / inch', pixelsPer, Icons.straighten)),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
+                        const SizedBox(width: 8),
+                        Expanded(child: _statTile('Depth', depthText, Icons.calculate)),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+
+                    // Diagnostics (always visible for now; we can hide behind a toggle later)
+                    if (true) _diagCard(),
+                    const SizedBox(height: 6),
+
+                    Row(
+                      children: [
+                        OutlinedButton.icon(
+                          onPressed: _measurementReady ? _compute : null,
+                          icon: const Icon(Icons.calculate),
+                          label: const Text('Compute depth'),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton.icon(
+                          onPressed: (_measuredInches != null && _measuredInches! > 0) ? _finish : null,
+                          icon: const Icon(Icons.check),
+                          label: const Text('Use depth'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _diagCard() {
+    final pxPerIn = _pxPerInch == null ? '--' : _pxPerInch!.toStringAsFixed(6);
+    final knownIn = _knownInchesCache == null ? '--' : _knownInchesCache!.toStringAsFixed(4);
+    final calibPx = _calibPxCache == null ? '--' : _calibPxCache!.toStringAsFixed(3);
+    final measPx  = _measPxCache  == null ? '--' : _measPxCache!.toStringAsFixed(3);
+    final measIn  = _measuredInches == null ? '--' : _measuredInches!.toStringAsFixed(3);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceVariant,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: DefaultTextStyle(
+        style: Theme.of(context).textTheme.bodySmall!,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Diagnostics', style: TextStyle(fontWeight: FontWeight.bold)),
+            Text('Known length (in):  $knownIn'),
+            Text('Calibration px:     $calibPx'),
+            Text('Pixels / inch:       $pxPerIn'),
+            Text('Measurement px:      $measPx'),
+            Text('Measurement (in):    $measIn'),
+          ],
+        ),
       ),
     );
   }
@@ -841,9 +813,7 @@ class _OverlayPainter extends CustomPainter {
 
       final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
       final midFill = Paint()
-        ..color = (line == blueLine)
-            ? const Color(0xFF1565C0)
-            : const Color(0xFF2E7D32)
+        ..color = (line == blueLine) ? const Color(0xFF1565C0) : const Color(0xFF2E7D32)
         ..style = PaintingStyle.fill
         ..isAntiAlias = true;
       final midStroke = Paint()
@@ -855,6 +825,7 @@ class _OverlayPainter extends CustomPainter {
       canvas.drawCircle(mid, midTickRScene, midStroke);
     }
 
+    // Draw (blue then green)
     point(calibA, blue);
     point(calibB, blue);
     drawSegment(calibA, calibB, blueLine);
@@ -869,6 +840,10 @@ class _OverlayPainter extends CustomPainter {
     return old.calibA != calibA ||
         old.calibB != calibB ||
         old.measA != measA ||
-        old.measB != measB;
+        old.measB != measB ||
+        old.dotRadiusScene != dotRadiusScene ||
+        old.haloRadiusScene != haloRadiusScene ||
+        old.strokeScene != strokeScene ||
+        old.midTickRScene != midTickRScene;
   }
 }

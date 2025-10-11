@@ -15,14 +15,12 @@ class MeasureDepthScreen extends StatefulWidget {
 enum MeasureMode { calibrate, measure }
 enum _Handle { none, calibA, calibB, measA, measB }
 enum _GestureMode { none, singleEdit, pinchZoom }
-enum UnitSystem { feet, meters }
 
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
-  // Unit + manual known length
-  UnitSystem _unit = UnitSystem.feet;
+  // --- Calibration input (imperial: feet & inches parsed into inches)
   final TextEditingController _knownLengthCtrl =
-      TextEditingController(text: '4.0');
+      TextEditingController(text: '4 ft'); // flexible input
 
   MeasureMode _mode = MeasureMode.calibrate;
 
@@ -31,13 +29,13 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   _Handle _dragging = _Handle.none;
 
   // Calibration
-  double? _pxPerUnit;     // pixels per ft or per m
-  double? _measuredValue; // measured value in selected unit
+  double? _pxPerInch;      // pixels per inch (imperial)
+  double? _measuredInches; // result in inches
 
   // Image size (intrinsic)
   Size? _imageSize;
 
-  // Visual tuning (screen-space base sizes; painter will keep them constant on screen)
+  // Visual tuning (screen-space base sizes; painter keeps them constant on screen)
   static const double _dotRadiusBase = 6;
   static const double _haloRadiusBase = 8;
   static const double _strokeBase = 3;
@@ -57,7 +55,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   double _startScale = 1.0;
   Offset _startSceneFocal = Offset.zero;
 
-  // Pointer tracking (prevents accidental taps when a second finger joins quickly)
+  // Pointer tracking to suppress accidental taps on pinch
   int _activePointers = 0;
   bool _everMultitouch = false;
 
@@ -74,7 +72,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   static const double _tapSlop = 8.0;
 
   double get _scale => _xfm.value.getMaxScaleOnAxis();
-  String get _unitShort => _unit == UnitSystem.feet ? 'ft' : 'm';
 
   @override
   void initState() {
@@ -171,7 +168,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     _activePointers++;
     if (_activePointers >= 2) {
       _everMultitouch = true;
-      // If we were in a single-finger edit, immediately switch to pinch mode
       if (_gMode == _GestureMode.singleEdit) {
         _gMode = _GestureMode.pinchZoom;
         _startMatrix = _xfm.value.clone();
@@ -184,10 +180,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
 
   void _onPointerUp(PointerUpEvent e) {
     _activePointers = (_activePointers - 1).clamp(0, 10);
-    if (_activePointers == 0) {
-      // New gesture next time
-      _everMultitouch = false;
-    }
+    if (_activePointers == 0) _everMultitouch = false;
   }
 
   // ---------- Unified gestures
@@ -226,7 +219,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     }
 
     final img = _imageSize!;
-    final vp = Size(img.width, img.height);
 
     if (_gMode == _GestureMode.singleEdit) {
       // If a second finger joins, switch to pinch mode and cancel edit (no point placement)
@@ -287,8 +279,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
         ..scale(desiredScale)
         ..translate(-_startSceneFocal.dx, -_startSceneFocal.dy);
 
-      // No focalPointDelta translation — avoids subtle overlay drift.
-
       _xfm.value = next;          // update continuously
       setState(() {});            // ensure overlay repaints same frame
       return;
@@ -307,7 +297,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       _gMode = _GestureMode.none;
       _startMatrix = null;
       _gestureMaxPointers = 0;
-      // do not reset _everMultitouch here; it resets when all pointers up
+      // _everMultitouch resets when all pointers are up
       return;
     }
 
@@ -388,55 +378,147 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     _animateTo(m);
   }
 
+  // ----- Imperial parsing/formatting
+  // Accepts:  "4' 6\"", "4-6", "4 ft 6 in", "4.5 ft", "54 in", "54\"", "4'6.5\"", "4.5"
+  // Returns inches, or null if invalid.
+  double? _parseImperialToInches(String raw) {
+    String s = raw.trim().toLowerCase().replaceAll(',', ' ');
+    if (s.isEmpty) return null;
+
+    // Replace common tokens
+    s = s
+        .replaceAll('feet', 'ft')
+        .replaceAll('foot', 'ft')
+        .replaceAll('inches', 'in')
+        .replaceAll('inch', 'in')
+        .replaceAll('"', 'in')
+        .replaceAll("''", 'in')
+        .replaceAll("’", "'")
+        .replaceAll('”', 'in')
+        .replaceAll('″', 'in')
+        .replaceAll('′', "'")
+        .replaceAll('  ', ' ');
+
+    // Patterns to try:
+    // 1) ft-in: e.g., 5' 7.5", 5ft 7.5in, 5-7.5
+    final ftIn = RegExp(r'^\s*(\d+(?:\.\d+)?)\s*(?:ft|\'|-)\s*(\d+(?:\.\d+)?)\s*(?:in)?\s*$');
+    final m1 = ftIn.firstMatch(s);
+    if (m1 != null) {
+      final ft = double.tryParse(m1.group(1)!);
+      final inch = double.tryParse(m1.group(2)!);
+      if (ft != null && inch != null) return ft * 12 + inch;
+    }
+
+    // 2) just feet (possibly decimal): "4.5 ft" or "4.5"
+    final justFt = RegExp(r'^\s*(\d+(?:\.\d+)?)\s*(?:ft)?\s*$');
+    final m2 = justFt.firstMatch(s);
+    if (m2 != null && s.contains('ft')) {
+      final ft = double.tryParse(m2.group(1)!);
+      if (ft != null) return ft * 12;
+    }
+    // If "4.5" without units—assume feet by default for convenience
+    if (m2 != null && !s.contains('in') && !s.contains("'")) {
+      final ft = double.tryParse(m2.group(1)!);
+      if (ft != null) return ft * 12;
+    }
+
+    // 3) just inches: "54 in"
+    final justIn = RegExp(r'^\s*(\d+(?:\.\d+)?)\s*in\s*$');
+    final m3 = justIn.firstMatch(s);
+    if (m3 != null) {
+      final inch = double.tryParse(m3.group(1)!);
+      if (inch != null) return inch;
+    }
+
+    return null;
+  }
+
+  // Format inches as feet-inches to nearest 1/16"
+  String _formatFeetInches(double inches, {bool withParenInches = true}) {
+    if (inches.isNaN || inches.isInfinite) return '--';
+    // Round to nearest 1/16"
+    final sixteenths = (inches * 16).round();
+    int wholeSixteenths = sixteenths;
+
+    final wholeInches = wholeSixteenths ~/ 16;
+    final frac16 = wholeSixteenths % 16;
+
+    final feet = wholeInches ~/ 12;
+    int inchesPart = wholeInches % 12;
+
+    // Reduce fraction (e.g., 8/16 -> 1/2)
+    int num = frac16;
+    int den = 16;
+    int gcd(int a, int b) => b == 0 ? a.abs() : gcd(b, a % b);
+    if (num != 0) {
+      final g = gcd(num, den);
+      num ~/= g; den ~/= g;
+    }
+
+    final pieces = <String>[];
+    pieces.add("$feet′");
+    if (num == 0) {
+      pieces.add(" $inchesPart″");
+    } else {
+      pieces.add(" $inchesPart ${num}/${den}″");
+    }
+
+    final main = pieces.join();
+    return withParenInches ? "$main (${inches.toStringAsFixed(2)} in)" : main;
+  }
+
   // ----- Calc / flow
   double _dist(Offset a, Offset b) => (a - b).distance;
 
   void _setCalibration() {
     if (!_calibrationReady) { _snack('Place two blue calibration points.'); return; }
-    final known = double.tryParse(_knownLengthCtrl.text);
-    if (known == null || known <= 0) { _snack('Enter a valid length in $_unitShort.'); return; }
+    final inches = _parseImperialToInches(_knownLengthCtrl.text);
+    if (inches == null || inches <= 0) {
+      _snack('Enter a valid length (e.g., 4′ 6″, 4.5 ft, 54 in).');
+      return;
+    }
     final px = _dist(_calibA!, _calibB!);
     if (px <= 0) { _snack('Calibration points overlap.'); return; }
 
     setState(() {
-      _pxPerUnit = px / known;
+      _pxPerInch = px / inches; // pixels per inch
       _mode = MeasureMode.measure;
-      // Clear calibration points so they disappear and only green points remain
+      // Clear calibration points per your request
       _calibA = null;
       _calibB = null;
       _measA = _measB = null;
-      _measuredValue = null;
+      _measuredInches = null;
     });
-    _snack('Calibrated: ${_pxPerUnit!.toStringAsFixed(2)} px/$_unitShort. Now measure (green).');
+    _snack('Calibrated: ${_pxPerInch!.toStringAsFixed(2)} px/in. Now measure (green).');
   }
 
   void _compute() {
-    if (_pxPerUnit == null) { _snack('Set calibration first.'); return; }
+    if (_pxPerInch == null) { _snack('Set calibration first.'); return; }
     if (!_measurementReady) { _snack('Place two green measurement points.'); return; }
     final px = _dist(_measA!, _measB!);
-    final val = px / _pxPerUnit!;
-    setState(() => _measuredValue = val);
-    _snack('Depth = ${val.toStringAsFixed(2)} $_unitShort');
+    final inches = px / _pxPerInch!;
+    setState(() => _measuredInches = inches);
+    _snack('Depth = ${_formatFeetInches(inches)}');
   }
 
   void _finish() {
-    if (_measuredValue == null || _measuredValue! <= 0) { _snack('No depth computed yet.'); return; }
-    Navigator.of(context).pop<double>(_measuredValue!);
+    if (_measuredInches == null || _measuredInches! <= 0) { _snack('No depth computed yet.'); return; }
+    // Return inches as the canonical value
+    Navigator.of(context).pop<double>(_measuredInches!);
   }
 
   void _resetAll() {
     setState(() {
       _calibA = _calibB = _measA = _measB = null;
-      _pxPerUnit = null; _measuredValue = null;
+      _pxPerInch = null; _measuredInches = null;
       _mode = MeasureMode.calibrate;
-      _knownLengthCtrl.text = '4.0';
+      _knownLengthCtrl.text = '4 ft';
       _dragging = _Handle.none;
-      _unit = UnitSystem.feet;
       _xfm.value = Matrix4.identity();
       _activePointers = 0;
       _everMultitouch = false;
     });
-    _snack('Reset. Choose unit, enter length, set two blue points.');
+    _snack('Reset. Enter known length (ft/in), then set two blue points.');
   }
 
   void _snack(String m) =>
@@ -447,6 +529,9 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
   Widget build(BuildContext context) {
     final imgW = _imageSize?.width ?? 400;
     final imgH = _imageSize?.height ?? 300;
+
+    final pixelsPer = _pxPerInch == null ? '--' : _pxPerInch!.toStringAsFixed(2);
+    final depthText = _measuredInches == null ? '--' : _formatFeetInches(_measuredInches!, withParenInches: true);
 
     return Scaffold(
       appBar: AppBar(
@@ -523,7 +608,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
             child: Wrap(
               spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                // Mode dropdown
                 _Box(
                   child: DropdownButtonHideUnderline(
                     child: DropdownButton<MeasureMode>(
@@ -537,32 +621,16 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                   ),
                 ),
                 if (_mode == MeasureMode.calibrate) ...[
-                  _Box(
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<UnitSystem>(
-                        value: _unit,
-                        onChanged: (u) => setState(() {
-                          _unit = u!;
-                          // Changing units invalidates calibration/measurements
-                          _pxPerUnit = null;
-                          _measuredValue = null;
-                        }),
-                        items: const [
-                          DropdownMenuItem(value: UnitSystem.feet, child: Text('Feet')),
-                          DropdownMenuItem(value: UnitSystem.meters, child: Text('Meters')),
-                        ],
-                      ),
-                    ),
-                  ),
                   ConstrainedBox(
-                    constraints: const BoxConstraints(minWidth: 180, maxWidth: 260),
+                    constraints: const BoxConstraints(minWidth: 220, maxWidth: 320),
                     child: TextField(
                       controller: _knownLengthCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      decoration: InputDecoration(
-                        labelText: 'Length (${_unitShort})',
-                        border: const OutlineInputBorder(),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      keyboardType: TextInputType.text,
+                      decoration: const InputDecoration(
+                        labelText: 'Known length (feet & inches)',
+                        hintText: 'e.g., 4′ 6″  |  4.5 ft  |  54 in',
+                        border: OutlineInputBorder(),
+                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       ),
                     ),
                   ),
@@ -589,7 +657,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                   children: [
                     Expanded(child: _statTile('Calibration pts', _calibrationReady ? '2/2 ✓' : (_calibA == null ? '0/2' : '1/2'), Icons.tune)),
                     const SizedBox(width: 8),
-                    Expanded(child: _statTile('Pixels / ${_unitShort}', _pxPerUnit == null ? '--' : _pxPerUnit!.toStringAsFixed(1), Icons.straighten)),
+                    Expanded(child: _statTile('Pixels / inch', pixelsPer, Icons.straighten)),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -597,7 +665,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                   children: [
                     Expanded(child: _statTile('Measure pts', _measurementReady ? '2/2 ✓' : (_measA == null ? '0/2' : '1/2'), Icons.straighten_outlined)),
                     const SizedBox(width: 8),
-                    Expanded(child: _statTile('Depth (${_unitShort})', _measuredValue == null ? '--' : _measuredValue!.toStringAsFixed(2), Icons.calculate)),
+                    Expanded(child: _statTile('Depth', depthText, Icons.calculate)),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -610,7 +678,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
                     ),
                     const SizedBox(width: 8),
                     FilledButton.icon(
-                      onPressed: (_measuredValue != null && _measuredValue! > 0) ? _finish : null,
+                      onPressed: (_measuredInches != null && _measuredInches! > 0) ? _finish : null,
                       icon: const Icon(Icons.check),
                       label: const Text('Use depth'),
                     ),
@@ -672,7 +740,7 @@ class _Box extends StatelessWidget {
 
 class _OverlayPainter extends CustomPainter {
   final Offset? calibA, calibB, measA, measB;
-  // these are already converted to scene-units so they stay constant on screen
+  // already converted to scene units (constant on screen)
   final double dotRadiusScene, haloRadiusScene, strokeScene, midTickRScene;
 
   _OverlayPainter({
@@ -749,7 +817,7 @@ class _OverlayPainter extends CustomPainter {
       canvas.drawCircle(mid, midTickRScene, midStroke);
     }
 
-    // Calibrate (blue) — only if present (they’re cleared after Set calibration)
+    // Calibrate (blue)
     point(calibA, blue);
     point(calibB, blue);
     drawSegment(calibA, calibB, blueLine);

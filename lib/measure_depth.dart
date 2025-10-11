@@ -20,35 +20,28 @@ enum _CalibKind { singleScale, plane } // 2-pt vs 4-pt (homography)
 class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     with TickerProviderStateMixin {
   // -------- Calibration inputs (imperial) --------
-  // Single-scale known length
   final TextEditingController _knownLengthCtrl =
-      TextEditingController(text: '21.5 in');
-
-  // Plane calibration known rectangle W×H
+      TextEditingController(text: '21.5 in'); // single-scale known length
   final TextEditingController _knownWidthCtrl =
-      TextEditingController(text: '4 ft');
+      TextEditingController(text: '4 ft');    // plane known rect width
   final TextEditingController _knownHeightCtrl =
-      TextEditingController(text: '2 ft');
+      TextEditingController(text: '2 ft');    // plane known rect height
 
   _CalibKind _calibKind = _CalibKind.singleScale;
   MeasureMode _mode = MeasureMode.calibrate;
 
   // Points in scene (image) space
   Offset? _calibA, _calibB;           // single-scale: two points
-  Offset? _calibC, _calibD;           // plane: four points (A,B,C,D) in order: TL, TR, BR, BL
+  Offset? _calibC, _calibD;           // plane: four points (TL, TR, BR, BL)
   Offset? _measA, _measB;
   _Handle _dragging = _Handle.none;
 
   // Calibration state
-  // Single-scale
-  double? _pxPerInch;
-  // Plane (homography): maps image (x,y,1) -> real-world inches (X,Y,1)
-  List<double>? _H; // 3x3 row-major, length 9
+  double? _pxPerInch;         // single-scale pixels per inch
+  List<double>? _H;           // plane homography (3x3, length 9, row-major)
+  double? _measuredInches;    // last result
 
-  // Measurement
-  double? _measuredInches;
-
-  // Diagnostics
+  // Diagnostics caches
   double? _knownInchesCache, _calibPxCache, _measPxCache;
   String _diagCalib = 'none';
 
@@ -231,7 +224,6 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     final feet = wholeInches ~/ 12;
     final inchesPart = wholeInches % 12;
 
-    // reduce fraction
     int num = frac16, den = 16;
     int gcd(int a, int b) => b == 0 ? a.abs() : gcd(b, a % b);
     if (num != 0) {
@@ -250,7 +242,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     final A = List.generate(8, (_) => List<double>.filled(8, 0));
     final b = List<double>.filled(8, 0.0);
 
-    List<Offset> ptsReal = [
+    final ptsReal = <Offset>[
       const Offset(0, 0),
       Offset(W, 0),
       Offset(W, H),
@@ -261,28 +253,20 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       final x = ptsImg[i].dx, y = ptsImg[i].dy;
       final X = ptsReal[i].dx, Y = ptsReal[i].dy;
 
-      A[2 * i][0] = -x;
-      A[2 * i][1] = -y;
-      A[2 * i][2] = -1;
-      A[2 * i][3] = 0;
-      A[2 * i][4] = 0;
-      A[2 * i][5] = 0;
-      A[2 * i][6] = x * X;
-      A[2 * i][7] = y * X;
-      b[2 * i] = -X;
+      // X row
+      A[2 * i][0] = -x;  A[2 * i][1] = -y;  A[2 * i][2] = -1;
+      A[2 * i][3] =  0;  A[2 * i][4] =  0;  A[2 * i][5] =  0;
+      A[2 * i][6] =  x * X; A[2 * i][7] = y * X;
+      b[2 * i]     = -X;
 
-      A[2 * i + 1][0] = 0;
-      A[2 * i + 1][1] = 0;
-      A[2 * i + 1][2] = 0;
-      A[2 * i + 1][3] = -x;
-      A[2 * i + 1][4] = -y;
-      A[2 * i + 1][5] = -1;
-      A[2 * i + 1][6] = x * Y;
-      A[2 * i + 1][7] = y * Y;
-      b[2 * i + 1] = -Y;
+      // Y row
+      A[2 * i + 1][0] =  0;  A[2 * i + 1][1] =  0;  A[2 * i + 1][2] =  0;
+      A[2 * i + 1][3] = -x;  A[2 * i + 1][4] = -y;  A[2 * i + 1][5] = -1;
+      A[2 * i + 1][6] =  x * Y; A[2 * i + 1][7] = y * Y;
+      b[2 * i + 1]     = -Y;
     }
 
-    final h = _solveLinear8x8(A, b);
+    final h = _solveLinear8x8(A, b); // [h11..h32], h33 = 1
     return <double>[
       h[0], h[1], h[2],
       h[3], h[4], h[5],
@@ -455,7 +439,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       final desiredScale = (_startScale * d.scale).clamp(_minScale, _maxScale);
       final focalV = d.localFocalPoint;
       Matrix4 next = Matrix4.identity()
-        ..translate(focalV.dx, f dy)
+        ..translate(focalV.dx, focalV.dy) // <-- fixed typo here
         ..scale(desiredScale)
         ..translate(-_startSceneFocal.dx, -_startSceneFocal.dy);
       _xfm.value = next;
@@ -663,7 +647,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
     final imgW = _imageSize?.width ?? 400;
     final imgH = _imageSize?.height ?? 300;
 
-    // Live label: compute inches if we have two green points and a calibration
+    // Live label while dragging/placing measurement
     String? liveLabel;
     if (_measA != null && _measB != null) {
       double? inches;
@@ -674,9 +658,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       } else if (_pxPerInch != null) {
         inches = _dist(_measA!, _measB!) / _pxPerInch!;
       }
-      if (inches != null) {
-        liveLabel = _formatFeetInches(inches, withParenInches: false);
-      }
+      if (inches != null) liveLabel = _formatFeetInches(inches, withParenInches: false);
     }
 
     return Scaffold(
@@ -686,6 +668,7 @@ class _MeasureDepthScreenState extends State<MeasureDepthScreen>
       ),
       body: LayoutBuilder(
         builder: (context, constraints) {
+          // Approx: reserve space for controls/readouts
           _viewportSize = Size(constraints.maxWidth, constraints.maxHeight - 240);
           final pxPer = _pxPerInch == null ? (_H != null ? 'plane' : '--') : _pxPerInch!.toStringAsFixed(3);
           final depthText = _measuredInches == null ? '--' : _formatFeetInches(_measuredInches!, withParenInches: true);
@@ -973,8 +956,8 @@ class _OverlayPainter extends CustomPainter {
   final _CalibKind calibKind;
   final Offset? calibA, calibB, calibC, calibD, measA, measB;
   final double dotRadiusScene, haloRadiusScene, strokeScene, midTickRScene;
-  final String? liveLabel;        // ← new
-  final double sceneFontPx;       // ← new (kept visually constant vs zoom)
+  final String? liveLabel;
+  final double sceneFontPx;
 
   _OverlayPainter({
     required this.calibKind,
@@ -1028,7 +1011,6 @@ class _OverlayPainter extends CustomPainter {
     // Calibration in blue
     point(calibA, blue); point(calibB, blue);
     segment(calibA, calibB, blueLine);
-
     if (calibKind == _CalibKind.plane) {
       point(calibC, blue); point(calibD, blue);
       segment(calibB, calibC, blueLine);
@@ -1043,12 +1025,12 @@ class _OverlayPainter extends CustomPainter {
     // Live label near the green segment midpoint
     if (liveLabel != null && measA != null && measB != null) {
       final mid = Offset((measA!.dx + measB!.dx) / 2, (measA!.dy + measB!.dy) / 2);
-      // Offset slightly perpendicular to the segment so it doesn't overlap the line
+      // Perpendicular offset so it doesn't overlap line
       final dir = (measB! - measA!);
       Offset n = dir == Offset.zero ? const Offset(0, -1) : Offset(-dir.dy, dir.dx);
       final len = n.distance;
       if (len != 0) n = n / len;
-      final labelPos = mid + n * (12.0); // 12 "scene" px
+      final labelPos = mid + n * 12.0;
 
       final tp = TextPainter(
         text: TextSpan(

@@ -1,26 +1,26 @@
-# Codemagic configuration — updated to surface first error lines and build iOS (device only, no codesign)
-# Notes:
-# - Uses a verbose build script that cleans Pods/DerivedData and captures flutter/xcode logs.
-# - Produces flutter_verbose.log as an artifact for quick triage.
-# - Targets iOS device builds without code signing.
-# - Keeps caches for faster subsequent builds.
+# codemagic.yaml — iOS device build (no codesign), verbose logging
+# Surfaces the first error line and saves flutter_verbose.log as artifact.
 
 workflows:
-  name:
-    name: iOS Release (no codesign) — verbose
+  ios_unsigned:
+    name: iOS Unsigned Build — verbose
     instance_type: mac_mini_m2
+    max_build_duration: 60
+    working_directory: .
 
     environment:
-      flutter: stable        # or pin to a specific version if you prefer
-      xcode: "15.4"          # match your local Xcode if needed
+      flutter: stable
+      xcode: "15.4"
       cocoapods: default
       vars:
         LC_ALL: en_US.UTF-8
         LANG: en_US.UTF-8
 
     scripts:
-      - name: Flutter pub get
+      - name: Prep (clean & pub get)
         script: |
+          set -euo pipefail
+          flutter clean
           flutter pub get
 
       - name: Build iOS (device only, no codesign, verbose)
@@ -37,7 +37,6 @@ workflows:
           flutter doctor -v || true
 
           # Clean caches that commonly cause phantom exits
-          flutter clean
           rm -rf ios/Pods ios/Podfile.lock ~/Library/Developer/Xcode/DerivedData
           cd ios && pod repo update && cd ..
 
@@ -46,7 +45,8 @@ workflows:
           export NSUnbufferedIO=YES
 
           # If you use flavors, append: --flavor <yourFlavor>
-          flutter build ios --release --no-codesign -v             --build-name=$CM_BUILD_NAME --build-number=$CM_BUILD_NUMBER 2>&1 | tee flutter_verbose.log
+          flutter build ios --release --no-codesign -v \
+            --build-name=$CM_BUILD_NAME --build-number=$CM_BUILD_NUMBER 2>&1 | tee flutter_verbose.log
 
           # If Flutter punts to xcodebuild, try to tail its last lines for context
           if grep -m1 -E "Xcode build done|Failed to build iOS app" flutter_verbose.log; then

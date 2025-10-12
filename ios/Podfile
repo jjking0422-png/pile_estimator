@@ -25,17 +25,17 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 flutter_ios_podfile_setup
 
 target 'Runner' do
-  use_frameworks!
-  use_modular_headers!
-
+  # ✅ No `use_frameworks!` / `use_modular_headers!`
   flutter_install_all_ios_pods(File.dirname(File.realpath(__FILE__)))
 
-  # Force every pod to use iOS 12.0 minimum (fixes ARCore/Firebase warnings)
   post_install do |installer|
+    # Keep min iOS 12.0 for all pods
     installer.pods_project.targets.each do |target|
       target.build_configurations.each do |config|
         config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
       end
     end
+    # Let Flutter add its additional settings (header search paths, etc.)
+    flutter_additional_ios_build_settings(installer)
   end
 end

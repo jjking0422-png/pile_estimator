@@ -1,3 +1,4 @@
+// android/app/build.gradle  (Kotlin DSL)
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -20,11 +21,9 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.example.pile_estimator"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // ✅ Pin minSdk to 24 for ARCore / ar_flutter_plugin
+        minSdk = 24
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

@@ -17,10 +17,8 @@ workflows:
       - name: Force Runner xcodeproj to iOS 13
         script: |
           set -euo pipefail
-          # Bump any lower targets to 13.0 inside the Xcode project (Runner)
           sed -i.bak 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]\+\(\.[0-9]\)\?;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' ios/Runner.xcodeproj/project.pbxproj
           rm -f ios/Runner.xcodeproj/project.pbxproj.bak
-          # Show confirmation
           grep -n "IPHONEOS_DEPLOYMENT_TARGET" ios/Runner.xcodeproj/project.pbxproj | head -n 10
 
       - name: CocoaPods repo update & install
@@ -32,17 +30,14 @@ workflows:
           pod install --verbose
           cd ..
 
-      - name: Build iOS (no codesign, verbose)
+      - name: Build iOS (device only, no codesign, verbose)
         script: |
           set -euo pipefail
           flutter --version
           xcodebuild -version
           pod --version
-          # Clean derived data to avoid stale caches between runs
           rm -rf ~/Library/Developer/Xcode/DerivedData
-          # Simulator build first to surface compile errors early
-          flutter build ios --simulator -v
-          # Device build (no codesign)
+          # Build for a real device (no codesign). ARKit is not supported on the iOS Simulator.
           flutter build ios --release --no-codesign -v
 
       - name: Package .app into unsigned IPA

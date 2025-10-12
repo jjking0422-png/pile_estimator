@@ -25,18 +25,21 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 flutter_ios_podfile_setup
 
 target 'Runner' do
-  # Needed for some Swift pods (e.g., FirebaseCoreInternal -> GoogleUtilities) when using static libs
+  # Needed by some Swift pods (e.g., FirebaseCoreInternal -> GoogleUtilities) with static libraries
   use_modular_headers!
 
   flutter_install_all_ios_pods(File.dirname(File.realpath(__FILE__)))
 
   post_install do |installer|
     installer.pods_project.targets.each do |target|
-      # Enforce iOS 13 and Swift 5 across all pods
       target.build_configurations.each do |config|
+        # Enforce iOS 13 + Swift 5 across all pods
         config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
         config.build_settings['SWIFT_VERSION'] = '5.0'
+        # Disable bitcode (modern toolchains expect this off; avoids ld/bitcode errors)
+        config.build_settings['ENABLE_BITCODE'] = 'NO'
       end
+
       # Apply Flutter’s per-target settings (correct usage)
       flutter_additional_ios_build_settings(target)
     end

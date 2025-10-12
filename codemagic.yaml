@@ -15,16 +15,22 @@ workflows:
           flutter pub get
       - name: CocoaPods repo update & install
         script: |
-          set -e
+          set -euo pipefail
           cd ios
           rm -rf Pods Podfile.lock
           pod repo update
-          pod install
+          pod install --verbose
           cd ..
-      - name: Build iOS (no codesign)
+      - name: Build iOS (no codesign, verbose)
         script: |
-          set -e
-          flutter build ios --release --no-codesign
+          set -euo pipefail
+          flutter --version
+          xcodebuild -version
+          pod --version
+          # Clean derived data to avoid stale caches between runs
+          rm -rf ~/Library/Developer/Xcode/DerivedData
+          # Verbose flutter build to surface the real failure
+          flutter build ios --release --no-codesign -v
       - name: Package .app into unsigned IPA
         script: |
           set -ex

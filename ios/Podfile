@@ -1,5 +1,5 @@
 # ios/Podfile
-platform :ios, '12.0'
+platform :ios, '13.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
 project 'Runner', {
@@ -29,10 +29,10 @@ target 'Runner' do
   flutter_install_all_ios_pods(File.dirname(File.realpath(__FILE__)))
 
   post_install do |installer|
-    # Keep min iOS 12.0 for all pods
+    # Keep min iOS 13.0 for all pods
     installer.pods_project.targets.each do |target|
       target.build_configurations.each do |config|
-        config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '12.0'
+        config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
       end
     end
     # Let Flutter add its additional settings (header search paths, etc.)

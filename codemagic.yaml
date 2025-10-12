@@ -17,6 +17,7 @@ workflows:
         script: |
           set -e
           cd ios
+          rm -rf Pods Podfile.lock
           pod repo update
           pod install
           cd ..

@@ -1,63 +1,81 @@
+# Codemagic configuration — updated to surface first error lines and build iOS (device only, no codesign)
+# Notes:
+# - Uses a verbose build script that cleans Pods/DerivedData and captures flutter/xcode logs.
+# - Produces flutter_verbose.log as an artifact for quick triage.
+# - Targets iOS device builds without code signing.
+# - Keeps caches for faster subsequent builds.
+
 workflows:
-  ios_unsigned:
-    name: iOS Unsigned Build
-    instance_type: mac_mini_m1
-    max_build_duration: 60
-    working_directory: .
+  name:
+    name: iOS Release (no codesign) — verbose
+    instance_type: mac_mini_m2
+
     environment:
-      flutter: stable
-      xcode: latest
+      flutter: stable        # or pin to a specific version if you prefer
+      xcode: "15.4"          # match your local Xcode if needed
+      cocoapods: default
+      vars:
+        LC_ALL: en_US.UTF-8
+        LANG: en_US.UTF-8
+
     scripts:
-      - name: Prep (clean & pub get)
+      - name: Flutter pub get
         script: |
-          set -euo pipefail
-          flutter clean
           flutter pub get
-
-      - name: Force Runner xcodeproj to iOS 13
-        script: |
-          set -euo pipefail
-          sed -i.bak 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]\+\(\.[0-9]\)\?;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' ios/Runner.xcodeproj/project.pbxproj
-          rm -f ios/Runner.xcodeproj/project.pbxproj.bak
-          grep -n "IPHONEOS_DEPLOYMENT_TARGET" ios/Runner.xcodeproj/project.pbxproj | head -n 10
-
-      - name: CocoaPods repo update & install
-        script: |
-          set -euo pipefail
-          cd ios
-          rm -rf Pods Podfile.lock
-          pod repo update
-          pod install --verbose
-          cd ..
 
       - name: Build iOS (device only, no codesign, verbose)
         script: |
           set -euo pipefail
-          flutter --version
-          xcodebuild -version
-          pod --version
-          rm -rf ~/Library/Developer/Xcode/DerivedData
-          # Build for a real device (no codesign). ARKit is not supported on the iOS Simulator.
-          flutter build ios --release --no-codesign -v
 
-      - name: Package .app into unsigned IPA
-        script: |
-          set -ex
-          echo "Searching for Runner.app under build/* ..."
-          APP_PATH=$(find build -type d -name "Runner.app" | head -n 1 || true)
-          if [ -z "$APP_PATH" ]; then
-            echo "Runner.app not found. Aborting."
-            find build -maxdepth 4 -type d | sed 's/^/FOUND DIR: /'
-            exit 1
+          # Show tool versions
+          flutter --version
+          dart --version
+          xcodebuild -version
+          pod --version || true
+
+          # Doctor is informative but non-blocking
+          flutter doctor -v || true
+
+          # Clean caches that commonly cause phantom exits
+          flutter clean
+          rm -rf ios/Pods ios/Podfile.lock ~/Library/Developer/Xcode/DerivedData
+          cd ios && pod repo update && cd ..
+
+          # Ultra-verbose Flutter build and capture logs
+          export FLUTTER_VERBOSE=true
+          export NSUnbufferedIO=YES
+
+          # If you use flavors, append: --flavor <yourFlavor>
+          flutter build ios --release --no-codesign -v             --build-name=$CM_BUILD_NAME --build-number=$CM_BUILD_NUMBER 2>&1 | tee flutter_verbose.log
+
+          # If Flutter punts to xcodebuild, try to tail its last lines for context
+          if grep -m1 -E "Xcode build done|Failed to build iOS app" flutter_verbose.log; then
+            XCODE_LOG=$(grep -m1 -oE "/.*xcodebuild.*\.log" flutter_verbose.log || true)
+            if [ -n "$XCODE_LOG" ] && [ -f "$XCODE_LOG" ]; then
+              echo "=== TAILING xcodebuild log (last 400 lines) ==="
+              tail -n 400 "$XCODE_LOG"
+            fi
           fi
-          echo "Found app at: $APP_PATH"
-          WORKDIR=$(pwd)
-          mkdir -p artifacts
-          cd "$(dirname "$APP_PATH")"
-          rm -rf Payload
-          mkdir Payload
-          cp -R "Runner.app" Payload/
-          zip -r "$WORKDIR/artifacts/Runner-unsigned.ipa" Payload
-          ls -l "$WORKDIR/artifacts"
+
+          # Highlight the first error-like line so we can fix root cause quickly
+          echo "=== FIRST ERROR-LIKE LINE ==="
+          grep -n -E "❌|error: |fatal error: |Undefined symbols|ld: warning|No such module|Command CompileSwift failed|Command Ld failed" flutter_verbose.log | head -n 1 || true
+
     artifacts:
-      - artifacts/*.ipa
+      - build/ios/**/*.xcarchive
+      - build/ios/iphoneos/*.app
+      - flutter_verbose.log
+
+    cache:
+      cache_paths:
+        - $HOME/Library/Caches/CocoaPods
+        - ios/Pods
+        - ~/.pub-cache
+
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: true

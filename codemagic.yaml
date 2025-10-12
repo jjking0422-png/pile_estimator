@@ -8,11 +8,18 @@ workflows:
       flutter: stable
       xcode: latest
     scripts:
-      - name: Prep
+      - name: Prep (clean & pub get)
         script: |
           set -e
           flutter clean
           flutter pub get
+      - name: CocoaPods repo update & install
+        script: |
+          set -e
+          cd ios
+          pod repo update
+          pod install
+          cd ..
       - name: Build iOS (no codesign)
         script: |
           set -e

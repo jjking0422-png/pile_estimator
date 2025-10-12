@@ -1,8 +1,9 @@
-# codemagic.yaml — iOS device build (no codesign), verbose logs + unsigned IPA artifact
-# - Surfaces the FIRST failing line so we can fix root cause quickly
-# - Cleans Pods/DerivedData to avoid phantom errors
+# codemagic.yaml — iOS device build (no codesign), robust defaults, verbose logs, unsigned IPA
+# - Does NOT assume CM_BUILD_NAME/CM_BUILD_NUMBER exist; derives from pubspec.yaml if missing
+# - Surfaces the FIRST failing line to speed up debugging
+# - Cleans Pods/DerivedData to avoid stale cache issues
 # - Saves flutter_verbose.log as an artifact
-# - On success, creates artifacts: .app, .xcarchive, and unsigned .ipa
+# - On success, creates: .app, .xcarchive, and unsigned .ipa
 
 workflows:
   ios_unsigned:
@@ -40,6 +41,22 @@ workflows:
           # Doctor is informative but non-blocking
           flutter doctor -v || true
 
+          # Resolve build name/number safely (do NOT assume Codemagic sets them)
+          # Read from pubspec.yaml: version: x.y.z+build
+          VERSION_LINE=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}')
+          if [ -z "${VERSION_LINE:-}" ]; then
+            VERSION_LINE="1.0.0+1"
+          fi
+          # Split into name and number
+          DEFAULT_BUILD_NAME="${VERSION_LINE%%+*}"
+          DEFAULT_BUILD_NUMBER="${VERSION_LINE##*+}"
+          if [ "${DEFAULT_BUILD_NUMBER}" = "${VERSION_LINE}" ]; then
+            DEFAULT_BUILD_NUMBER="1"
+          fi
+          BUILD_NAME="${CM_BUILD_NAME:-$DEFAULT_BUILD_NAME}"
+          BUILD_NUMBER="${CM_BUILD_NUMBER:-$DEFAULT_BUILD_NUMBER}"
+          echo "Using BUILD_NAME=${BUILD_NAME}, BUILD_NUMBER=${BUILD_NUMBER}"
+
           # Clean caches that commonly cause phantom exits
           rm -rf ios/Pods ios/Podfile.lock ~/Library/Developer/Xcode/DerivedData
           cd ios && pod repo update && cd ..
@@ -50,7 +67,7 @@ workflows:
 
           # If you use flavors, append: --flavor <yourFlavor>
           flutter build ios --release --no-codesign -v \
-            --build-name=$CM_BUILD_NAME --build-number=$CM_BUILD_NUMBER 2>&1 | tee flutter_verbose.log \
+            --build-name="${BUILD_NAME}" --build-number="${BUILD_NUMBER}" 2>&1 | tee flutter_verbose.log \
             || BUILD_STATUS=$?
 
           # If Flutter punted to xcodebuild, try to tail its last lines for context

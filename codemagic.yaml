@@ -1,5 +1,8 @@
-# codemagic.yaml — iOS device build (no codesign), verbose logging
-# Surfaces the first error line and saves flutter_verbose.log as artifact.
+# codemagic.yaml — iOS device build (no codesign), verbose logs + unsigned IPA artifact
+# - Surfaces the FIRST failing line so we can fix root cause quickly
+# - Cleans Pods/DerivedData to avoid phantom errors
+# - Saves flutter_verbose.log as an artifact
+# - On success, creates artifacts: .app, .xcarchive, and unsigned .ipa
 
 workflows:
   ios_unsigned:
@@ -26,6 +29,7 @@ workflows:
       - name: Build iOS (device only, no codesign, verbose)
         script: |
           set -euo pipefail
+          BUILD_STATUS=0
 
           # Show tool versions
           flutter --version
@@ -46,9 +50,10 @@ workflows:
 
           # If you use flavors, append: --flavor <yourFlavor>
           flutter build ios --release --no-codesign -v \
-            --build-name=$CM_BUILD_NAME --build-number=$CM_BUILD_NUMBER 2>&1 | tee flutter_verbose.log
+            --build-name=$CM_BUILD_NAME --build-number=$CM_BUILD_NUMBER 2>&1 | tee flutter_verbose.log \
+            || BUILD_STATUS=$?
 
-          # If Flutter punts to xcodebuild, try to tail its last lines for context
+          # If Flutter punted to xcodebuild, try to tail its last lines for context
           if grep -m1 -E "Xcode build done|Failed to build iOS app" flutter_verbose.log; then
             XCODE_LOG=$(grep -m1 -oE "/.*xcodebuild.*\.log" flutter_verbose.log || true)
             if [ -n "$XCODE_LOG" ] && [ -f "$XCODE_LOG" ]; then
@@ -61,7 +66,29 @@ workflows:
           echo "=== FIRST ERROR-LIKE LINE ==="
           grep -n -E "❌|error: |fatal error: |Undefined symbols|ld: warning|No such module|Command CompileSwift failed|Command Ld failed" flutter_verbose.log | head -n 1 || true
 
+          # Propagate the original build exit status (0 on success, non-zero on failure)
+          exit $BUILD_STATUS
+
+      - name: Package unsigned IPA (runs only if build succeeded)
+        script: |
+          set -euo pipefail
+          APP_PATH=$(find build/ios/iphoneos -name "Runner.app" -type d -print -quit || true)
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "Runner.app not found; skipping unsigned IPA packaging."
+            exit 0
+          fi
+          echo "Found app at: $APP_PATH"
+          WORKDIR=$(pwd)
+          mkdir -p artifacts
+          cd "$(dirname "$APP_PATH")"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "Runner.app" Payload/
+          zip -r "$WORKDIR/artifacts/Runner-unsigned.ipa" Payload
+          ls -l "$WORKDIR/artifacts"
+
     artifacts:
+      - artifacts/*.ipa
       - build/ios/**/*.xcarchive
       - build/ios/iphoneos/*.app
       - flutter_verbose.log

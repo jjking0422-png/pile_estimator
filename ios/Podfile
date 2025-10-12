@@ -25,17 +25,29 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 flutter_ios_podfile_setup
 
 target 'Runner' do
-  # ✅ No `use_frameworks!` / `use_modular_headers!`
+  # ✅ Needed for Swift pods like FirebaseCoreInternal -> GoogleUtilities
+  use_modular_headers!
+
   flutter_install_all_ios_pods(File.dirname(File.realpath(__FILE__)))
 
   post_install do |installer|
-    # Keep min iOS 13.0 for all pods
+    # Minimum iOS for all pods
     installer.pods_project.targets.each do |target|
       target.build_configurations.each do |config|
         config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
       end
     end
-    # Let Flutter add its additional settings (header search paths, etc.)
+
+    # Ensure Flutter adds its header search paths & settings
     flutter_additional_ios_build_settings(installer)
+
+    # (Extra safety) Make GoogleUtilities/Firebase produce modules
+    installer.pods_project.targets.each do |t|
+      if t.name == 'GoogleUtilities' || t.name.start_with?('Firebase')
+        t.build_configurations.each do |config|
+          config.build_settings['DEFINES_MODULE'] = 'YES'
+        end
+      end
+    end
   end
 end

@@ -10,9 +10,19 @@ workflows:
     scripts:
       - name: Prep (clean & pub get)
         script: |
-          set -e
+          set -euo pipefail
           flutter clean
           flutter pub get
+
+      - name: Force Runner xcodeproj to iOS 13
+        script: |
+          set -euo pipefail
+          # Bump any lower targets to 13.0 inside the Xcode project (Runner)
+          sed -i.bak 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9]\+\(\.[0-9]\)\?;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' ios/Runner.xcodeproj/project.pbxproj
+          rm -f ios/Runner.xcodeproj/project.pbxproj.bak
+          # Show confirmation
+          grep -n "IPHONEOS_DEPLOYMENT_TARGET" ios/Runner.xcodeproj/project.pbxproj | head -n 10
+
       - name: CocoaPods repo update & install
         script: |
           set -euo pipefail
@@ -21,6 +31,7 @@ workflows:
           pod repo update
           pod install --verbose
           cd ..
+
       - name: Build iOS (no codesign, verbose)
         script: |
           set -euo pipefail
@@ -29,8 +40,11 @@ workflows:
           pod --version
           # Clean derived data to avoid stale caches between runs
           rm -rf ~/Library/Developer/Xcode/DerivedData
-          # Verbose flutter build to surface the real failure
+          # Simulator build first to surface compile errors early
+          flutter build ios --simulator -v
+          # Device build (no codesign)
           flutter build ios --release --no-codesign -v
+
       - name: Package .app into unsigned IPA
         script: |
           set -ex
